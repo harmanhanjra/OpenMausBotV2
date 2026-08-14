@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">OpenMausBot</title>
+  <desc id="desc">A large silver gradient SupaMaus cursor entering from the left side of a dark app tile.</desc>
+
+  <defs>
+    <clipPath id="mac-tile">
+      <rect width="1024" height="1024" rx="224" />
+    </clipPath>
+
+    <radialGradient id="tile" cx="68%" cy="36%" r="92%">
+      <stop offset="0" stop-color="#202227" />
+      <stop offset="0.56" stop-color="#131419" />
+      <stop offset="1" stop-color="#090A0D" />
+    </radialGradient>
+
+    <linearGradient id="mascot-grey" x1="18%" y1="10%" x2="84%" y2="94%">
+      <stop offset="0" stop-color="#FFFFFF" />
+      <stop offset="0.28" stop-color="#E6E8EB" />
+      <stop offset="0.58" stop-color="#B7BBC2" />
+      <stop offset="0.82" stop-color="#848A94" />
+      <stop offset="1" stop-color="#5B616B" />
+    </linearGradient>
+  </defs>
+
+  <g clip-path="url(#mac-tile)">
+    <rect width="1024" height="1024" fill="url(#tile)" />
+
+    <!-- Oversized, tilted, and deliberately clipped by the left/bottom edges. -->
+    <svg x="-260" y="-140" width="1300" height="1300" viewBox="10 10 180 180" overflow="visible">
+      <g transform="rotate(25 100 100)">
+        <path
+          d="M93.4 40.6 L43 151.1 Q38 162 48.4 156 L91.4 131 Q100 126 108.7 131 L151.6 156 Q162 162 157 151.1 L106.6 40.6 Q100 26 93.4 40.6 Z"
+          fill="url(#mascot-grey)"
+        />
+
+        <!-- Large reference-style pill eyes and a smile that survive Dock scale. -->
+        <rect x="84.5" y="75" width="9" height="24" rx="4.5" fill="#101114" transform="rotate(-15 89 87)" />
+        <rect x="108.5" y="75" width="9" height="24" rx="4.5" fill="#101114" transform="rotate(-7 113 87)" />
+        <path d="M86 106 Q101 124 117 105" stroke="#101114" stroke-width="7" stroke-linecap="round" fill="none" />
+      </g>
+    </svg>
+
+    <rect x="8" y="8" width="1008" height="1008" rx="216" fill="none" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="16" />
+  </g>
+</svg>

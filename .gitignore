@@ -1,0 +1,14 @@
+node_modules
+dist
+dist-server
+dist-electron
+release
+*.local
+*.log
+.DS_Store
+*.tsbuildinfo
+.env
+.env.*
+.claude
+electron/resources/speech-helper
+.omb-scratch

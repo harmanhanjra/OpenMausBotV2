@@ -1,0 +1,91 @@
+appId: com.openmausbot.app
+productName: OpenMausBot
+artifactName: OpenMausBot-${version}-${arch}.${ext}
+
+# In-app auto-update reads latest-mac.yml + the .zip (macOS) or latest.yml +
+# the NSIS .exe (Windows) from this PUBLIC releases repo (separate from the
+# source repo). Public → no token on users' machines. Baked into
+# app-update.yml; both metadata files are emitted here even with
+# --publish never, and must be uploaded to the GitHub release alongside the
+# artifacts — a release missing latest.yml leaves every Windows install
+# stranded on its installed version.
+publish:
+  - provider: github
+    owner: milind-soni
+    repo: openmausbot-releases
+
+directories:
+  buildResources: build
+  output: release
+
+# The app is three self-contained pieces, none needing node_modules at
+# runtime: the Electron main/preload (plain .mjs/.cjs), the built UI
+# (Vite → ui/), and the compiled harness server (tsc → server/), both
+# shipped in Resources and run on Electron's own Node via
+# ELECTRON_RUN_AS_NODE (the agentcal-hq pattern).
+files:
+  - electron/**
+  - "!electron/resources/speech-helper"
+  - "!**/node_modules/**"
+  - package.json
+
+asar: true
+
+extraResources:
+  - from: dist
+    to: ui
+  - from: dist-server
+    to: server
+
+mac:
+  target:
+    - target: dmg
+      arch: arm64
+    - target: zip
+      arch: arm64
+  icon: build/icon.icns
+  category: public.app-category.productivity
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # the dictation helper is a signed macOS binary — Windows never sees it
+  extraResources:
+    - from: electron/resources/speech-helper
+      to: speech-helper
+  extendInfo:
+    NSMicrophoneUsageDescription: OpenMausBot uses the microphone for voice dictation into the composer.
+    NSSpeechRecognitionUsageDescription: OpenMausBot transcribes your voice on-device to type messages for you.
+  # Notarization runs manually after the build (notarytool + staple),
+  # mirroring the BlueyLite ship_release.sh flow.
+  notarize: false
+
+dmg:
+  sign: true
+  artifactName: OpenMausBot-${version}.dmg
+
+win:
+  target:
+    - target: nsis
+      arch: x64
+    - target: zip
+      arch: x64
+  icon: build/icon.ico
+  # No signing config yet (would go under win.signtoolOptions or
+  # win.azureSignOptions — eb 26 nests it, there is no top-level
+  # win.certificateFile). The installer is unsigned, so SmartScreen shows
+  # "unknown publisher" on first run (README says so). verifyUpdateCodeSignature
+  # defaults true, but electron-updater skips the check when app-update.yml
+  # carries no publisherName — so auto-update still works today. Do NOT set
+  # publisherName without actually signing, or every update is rejected as
+  # untrusted; and once signed, keep the cert subject stable (or list both old
+  # and new in publisherName) or you strand already-installed users.
+
+nsis:
+  oneClick: true
+  perMachine: false
+  shortcutName: OpenMausBot
+  # Versioned, like the .dmg. The README's /latest/download/ button needs a
+  # STABLE filename, so ship a second copy named OpenMausBot-setup.exe on the
+  # release — the same trick as OpenMausBot.dmg beside OpenMausBot-${version}.dmg.
+  artifactName: OpenMausBot-${version}-setup.${ext}

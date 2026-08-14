@@ -1,0 +1,53 @@
+{
+  "name": "openmausbot",
+  "private": true,
+  "version": "0.1.15",
+  "type": "module",
+  "main": "electron/main.mjs",
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "dev": "vite",
+    "dev:server": "node --experimental-strip-types server/index.ts",
+    "dev:desktop": "electron .",
+    "build": "tsc -b && tsc -p tsconfig.server.json && vite build",
+    "typecheck": "tsc -b && tsc -p tsconfig.server.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "preview": "vite preview",
+    "build:server": "tsc -p tsconfig.server.build.json",
+    "build:speech": "swiftc -O electron/resources/speech-helper.swift -o electron/resources/speech-helper",
+    "build:updater": "node scripts/bundle-updater.mjs",
+    "package": "pnpm build && pnpm build:server && pnpm build:speech && pnpm build:updater && electron-builder --mac --publish never",
+    "package:win": "pnpm build && pnpm build:server && pnpm build:updater && electron-builder --win --publish never"
+  },
+  "dependencies": {
+    "@trycua/cua-driver": "^0.19.3",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.539.0",
+    "posthog-js": "^1.415.6",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "shiki": "^4.4.3",
+    "tailwind-merge": "^3.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.11",
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3",
+    "electron-updater": "^6.8.9",
+    "esbuild": "^0.28.2",
+    "tailwindcss": "^4.1.11",
+    "typescript": "^5.8.3",
+    "vite": "^7.1.0",
+    "vitest": "^4.1.10"
+  }
+}
