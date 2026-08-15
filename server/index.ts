@@ -101,11 +101,17 @@ function askBotAndWait(targetBotId: string, message: string, depth: number): Pro
   });
 }
 
-// default selection for new bots: first available instance, claude preferred
+// default selection for new bots: the primeAgent "default brain" (best
+// NVIDIA model via prime-agent) when it's up, otherwise the first available
+// instance with claudeAgent preferred, falling back to a stock snapshot.
 async function defaultSelection() {
   const described = await registry.describe();
   const available = described.filter((d) => d.snapshot.state === "available");
-  const pick = available.find((d) => d.driverKind === "claudeAgent") ?? available[0] ?? described[0];
+  const pick =
+    available.find((d) => d.driverKind === "primeAgent") ??
+    available.find((d) => d.driverKind === "claudeAgent") ??
+    available[0] ??
+    described[0];
   return { instanceId: pick?.instanceId ?? "claude", model: pick?.models.default || "claude-sonnet-5" };
 }
 let bootSelection = { instanceId: "claude", model: "claude-sonnet-5" };
@@ -591,7 +597,7 @@ async function runGroupMemberTurn(
     });
     const timer = setTimeout(finish, 5 * 60_000);
     instance.adapter
-      .sendTurn({ threadId: group.threadId, text, system })
+      .sendTurn({ threadId: group.threadId, text, system, model: bot.modelSelection.model })
       .catch((err) => {
         const failure = store.appendMessage(group.threadId, {
           role: "bot",

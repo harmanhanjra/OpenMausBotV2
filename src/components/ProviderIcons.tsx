@@ -44,6 +44,18 @@ export function NvidiaMark({ size = 16, className }: IconProps) {
   );
 }
 
+export function PrimeAgentMark({ size = 16, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" className={cn("text-ink-secondary", className)}>
+      <path
+        d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm2.2 4.4c1 .5 1.7 1.4 2 2.5l.2.9c.1.3-.1.6-.4.7l-2 .5c-.3.1-.6-.1-.6-.4l-.1-.5c-.2-.7-.7-1.2-1.4-1.4a2 2 0 0 0-1.9 2.4c.2.9 1 1.5 1.9 1.4.6-.1 1.1-.4 1.5-.8l1.5 1.4c-.7.7-1.5 1.1-2.5 1.2a4 4 0 0 1-4.7-4.3c.3-1.9 1.9-3.3 3.8-3.3h.5c.8-.1 1.6 0 2.2.2Z"
+        fill="currentColor"
+      />
+      <circle cx="12" cy="12" r="1" fill="currentColor" />
+    </svg>
+  );
+}
+
 export function ProviderMark({ driverKind, size, className }: IconProps & { driverKind: string }) {
   switch (driverKind) {
     case "grok":
@@ -55,6 +67,8 @@ export function ProviderMark({ driverKind, size, className }: IconProps & { driv
       return <CodexMark size={size} className={className} />;
     case "nvidia":
       return <NvidiaMark size={size} className={className} />;
+    case "primeAgent":
+      return <PrimeAgentMark size={size} className={className} />;
     case "boxAgent":
       return <ComputerMark size={size} className={className} />;
     default:

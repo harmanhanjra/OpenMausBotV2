@@ -102,6 +102,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
           codex: { driver: "codex" },
           antigravity: { driver: "antigravityAgent" },
           nvidia: { driver: "nvidia" },
+          prime: { driver: "primeAgent" },
           computer: { driver: "boxAgent" },
         };
   for (const entry of Object.values(map)) {

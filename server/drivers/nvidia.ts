@@ -29,8 +29,8 @@ import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "nvidia";
-const DEFAULT_URL = "https://integrate.api.nvidia.com/v1";
-const DEFAULT_KEY_ENV = "NVIDIA_API_KEY";
+export const DEFAULT_URL = "https://integrate.api.nvidia.com/v1";
+export const DEFAULT_KEY_ENV = "NVIDIA_API_KEY";
 
 // Hosted NIM model catalog — used as the FALLBACK when the live /v1/models
 // discovery (see discoverModels) can't reach the endpoint. The authoritative
@@ -74,7 +74,7 @@ const MODEL_CACHE = new Map<string, { at: number; catalog: ModelCatalog }>();
 // matched as raw substrings (case-insensitive) because NIM model IDs
 // concatenate tokens — nv-embedqa-e5-v5, nemoguard, nvclip, bge-m3,
 // nemoretriever — where word boundaries miss the match.
-function isNonChatModel(id: string): boolean {
+export function isNonChatModel(id: string): boolean {
   const t = id.toLowerCase();
   return [
     "embed", "rerank", "retriev", "search",
@@ -95,7 +95,7 @@ function prettyLabel(id: string): string {
 
 /** Query the endpoint's OpenAI-compatible /v1/models; null when unreachable
  * or when no chat-capable models are listed. Filtered to text/chat models. */
-async function discoverModels(baseUrl: string, apiKey: string, timeoutMs = 4000): Promise<ModelCatalog | null> {
+export async function discoverModels(baseUrl: string, apiKey: string, timeoutMs = 4000): Promise<ModelCatalog | null> {
   try {
     const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/models`, {
       headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},

@@ -12,3 +12,5 @@ release
 .claude
 electron/resources/speech-helper
 .omb-scratch
+_discover-test.ts
+_fetch-probe*.mjs
