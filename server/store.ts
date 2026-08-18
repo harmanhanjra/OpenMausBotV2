@@ -2,11 +2,12 @@
 // thread→instance binding and per-instance resume cursors — upstream's
 // ProviderSessionDirectory, recipe step 6: persist the binding from day
 // one). messages-<threadId>.json holds the folded transcript.
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
+import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
 import { newId, type ModelSelection, type ThreadId } from "./contracts.ts";
+import { readJsonFile, removeFile } from "./fs-safe.ts";
 import { pickBotName } from "./names.ts";
 
 export type MausColor =
@@ -165,16 +166,8 @@ export class Store {
   constructor(defaultSelection: () => ModelSelection) {
     this.defaultSelection = defaultSelection;
     mkdirSync(DATA_DIR, { recursive: true });
-    try {
-      this.bots = JSON.parse(readFileSync(BOTS_FILE, "utf8"));
-    } catch {
-      this.bots = [];
-    }
-    try {
-      this.groups = JSON.parse(readFileSync(GROUPS_FILE, "utf8"));
-    } catch {
-      this.groups = [];
-    }
+    this.bots = readJsonFile<BotRecord[]>(BOTS_FILE, "store") ?? [];
+    this.groups = readJsonFile<GroupRecord[]>(GROUPS_FILE, "store") ?? [];
     // busy never survives a restart — no turn does either
     for (const b of this.bots) b.busy = false;
     for (const g of this.groups) g.busyBotId = null;
@@ -235,9 +228,7 @@ export class Store {
     this.groups = this.groups.filter((g) => g.id !== id);
     this.threads.delete(group.threadId);
     this.saveGroups();
-    try {
-      unlinkSync(messagesFile(group.threadId));
-    } catch {}
+    removeFile(messagesFile(group.threadId), "store");
     return true;
   }
 
@@ -256,15 +247,11 @@ export class Store {
     if (t) return t;
     let messages: Message[] = [];
     let activeLeafId: string | null = null;
-    try {
-      const raw = JSON.parse(readFileSync(messagesFile(threadId), "utf8"));
-      if (Array.isArray(raw)) messages = raw; // pre-branching flat file
-      else {
-        messages = raw.messages ?? [];
-        activeLeafId = raw.activeLeafId ?? null;
-      }
-    } catch {
-      /* fresh thread */
+    const raw = readJsonFile<Message[] | ThreadState>(messagesFile(threadId), "store");
+    if (Array.isArray(raw)) messages = raw; // pre-branching flat file
+    else if (raw) {
+      messages = raw.messages ?? [];
+      activeLeafId = raw.activeLeafId ?? null;
     }
     // legacy rows carry no parentId — chain them in array order
     let prev: string | null = null;
@@ -417,9 +404,7 @@ export class Store {
     this.bots = this.bots.filter((b) => b.id !== id);
     this.threads.delete(bot.threadId);
     this.saveBots();
-    try {
-      unlinkSync(messagesFile(bot.threadId));
-    } catch {}
+    removeFile(messagesFile(bot.threadId), "store");
     return true;
   }
 

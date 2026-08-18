@@ -543,6 +543,17 @@ export async function api(path: string, init?: RequestInit): Promise<any> {
   return body;
 }
 
+/**
+ * Background requests nothing in the UI waits on (badge clearing, card
+ * persistence). They must not interrupt the user, but a failure still
+ * belongs in the console instead of vanishing.
+ */
+export const logFailure =
+  (what: string) =>
+  (e: unknown): void => {
+    console.error(`${what} failed:`, e);
+  };
+
 /** Per-frame stream state lives in its OWN context: token frames update only
  * the components that read this hook (the chat's streaming tail), while every
  * useStore consumer — sidebar, mascots, pickers, the settled transcript —
@@ -616,7 +627,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         method: "PATCH",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(patch),
-      }).catch(() => {});
+      }).catch(logFailure(`persisting card ${messageId}`));
     };
 
     const wrapped: React.Dispatch<Action> = (action) => {
@@ -670,7 +681,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             api(`/api/bots/${action.botId}/respond`, {
               method: "POST",
               body: JSON.stringify({ requestId: card.requestId, behavior: "deny", message: "Dismissed by user." }),
-            }).catch(() => {});
+            }).catch(logFailure("dismissing a request"));
           } else {
             persistCard(action.botId, action.messageId, { dismissed: true });
           }
@@ -708,16 +719,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         case "markUnread":
           api(`/api/bots/${action.botId}`, { method: "PATCH", body: JSON.stringify({ unread: true }) }).catch(
-            () => {},
+            logFailure("marking unread"),
           );
           break;
         case "select": {
           const bot = stateRef.current.bots.find((b) => b.id === action.id);
           const group = stateRef.current.groups.find((g) => g.id === action.id);
           if (bot?.unread) {
-            api(`/api/bots/${action.id}`, { method: "PATCH", body: JSON.stringify({ unread: false }) }).catch(() => {});
+            api(`/api/bots/${action.id}`, { method: "PATCH", body: JSON.stringify({ unread: false }) }).catch(
+              logFailure("clearing the unread badge"),
+            );
           } else if (group?.unread) {
-            api(`/api/groups/${action.id}`, { method: "PATCH", body: JSON.stringify({ unread: false }) }).catch(() => {});
+            api(`/api/groups/${action.id}`, { method: "PATCH", body: JSON.stringify({ unread: false }) }).catch(
+              logFailure("clearing the unread badge"),
+            );
           }
           break;
         }
@@ -789,16 +804,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // ── initial load + SSE fold ──────────────────────────────────────────
   useEffect(() => {
     let alive = true;
+    // a failed load leaves the app looking empty rather than broken, so say
+    // what did not load; the disconnected banner covers a down server, so
+    // only surface this once the event stream is up
+    const loadFailed = (what: string) => (e: unknown) => {
+      console.error(`loading ${what} failed:`, e);
+      if (!alive || !stateRef.current.connected) return;
+      rawDispatch({ type: "error", message: `Could not load ${what}: ${e instanceof Error ? e.message : String(e)}` });
+      setTimeout(() => alive && rawDispatch({ type: "error", message: null }), 6000);
+    };
     const loadAll = () => {
       api("/api/bots")
         .then(({ bots, groups }) => alive && rawDispatch({ type: "hydrate", bots, groups: groups ?? [] }))
-        .catch(() => {});
+        .catch(loadFailed("your bots"));
       api("/api/instances")
         .then(({ instances }) => alive && rawDispatch({ type: "instances", instances }))
-        .catch(() => {});
+        .catch(loadFailed("the model list"));
       api("/api/config")
         .then((config) => alive && rawDispatch({ type: "configStatus", config }))
-        .catch(() => {});
+        .catch(loadFailed("your settings"));
     };
     loadAll();
 
@@ -838,7 +862,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               method: "PATCH",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ unread: false }),
-            }).catch(() => {});
+            }).catch(logFailure("clearing the unread badge"));
           }
           rawDispatch({ type: "botPatched", bot });
           break;
@@ -852,7 +876,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               method: "PATCH",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ unread: false }),
-            }).catch(() => {});
+            }).catch(logFailure("clearing the unread badge"));
           }
           rawDispatch({ type: "groupPatched", group });
           break;
@@ -908,7 +932,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           });
           api("/api/instances")
             .then(({ instances }) => rawDispatch({ type: "instances", instances }))
-            .catch(() => {});
+            .catch(logFailure("refreshing the model list"));
           break;
       }
     };

@@ -104,17 +104,42 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       let nextId = 1;
       const rpcPending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
 
+      // a failed stdin write means the app-server will never answer: the
+      // request it belongs to would hang until the turn timed out, so end
+      // the turn with the write error instead of dropping it
       const send = (obj: unknown) => {
+        appendNative(threadId, { dir: "out", source: "codex.app-server", msg: obj });
         try {
           child.stdin.write(JSON.stringify(obj) + "\n");
-        } catch {}
-        appendNative(threadId, { dir: "out", source: "codex.app-server", msg: obj });
+        } catch (e) {
+          const message = `cannot write to codex app-server: ${e instanceof Error ? e.message : String(e)}`;
+          if (!state.settled) {
+            emit({ ...base(threadId, turnId), type: "runtime.error", message });
+            settle(false, "stdin_write_failed");
+          }
+          throw new Error(message, { cause: e });
+        }
+      };
+      // answers and notifications have no caller waiting on them: send()
+      // has already reported and ended the turn, so don't rethrow into a
+      // stream/timer callback and crash the process
+      const sendBestEffort = (obj: unknown) => {
+        try {
+          send(obj);
+        } catch (e) {
+          console.error("codex: dropped an outbound message —", e);
+        }
       };
       const request = (method: string, params: unknown) =>
         new Promise<any>((resolve, reject) => {
           const id = nextId++;
           rpcPending.set(id, { resolve, reject });
-          send({ jsonrpc: "2.0", id, method, params });
+          try {
+            send({ jsonrpc: "2.0", id, method, params });
+          } catch (e) {
+            rpcPending.delete(id);
+            reject(e instanceof Error ? e : new Error(String(e)));
+          }
         });
 
       const stop = () => killCliTree(child);
@@ -122,7 +147,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const settle = (ok: boolean, stopReason: string | null) => {
         if (state.settled) return;
         state.settled = true;
-        for (const finish of [...asks.values()]) finish("deny", "OpenMausBot: the turn ended");
+        for (const finish of [...asks.values()]) {
+          try {
+            finish("deny", "OpenMausBot: the turn ended");
+          } catch (e) {
+            console.error("codex: could not decline a pending request while settling —", e);
+          }
+        }
         for (const p of rpcPending.values()) p.reject(new Error("turn settled"));
         rpcPending.clear();
         active.delete(threadId);
@@ -143,7 +174,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               ? "ask_user"
               : "shell";
         if (config.fullAuto && !isQuestion) {
-          return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "approved" : "accept" } });
+          return sendBestEffort({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "approved" : "accept" } });
         }
         const requestId = newId();
         const summary =
@@ -165,9 +196,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             for (const q of Array.isArray(params.questions) ? params.questions : []) {
               answers[q.id] = { answers: [message || QUESTION_TIMEOUT_NOTE] };
             }
-            send({ jsonrpc: "2.0", id: msg.id, result: { answers } });
+            sendBestEffort({ jsonrpc: "2.0", id: msg.id, result: { answers } });
           } else {
-            send({
+            sendBestEffort({
               jsonrpc: "2.0",
               id: msg.id,
               result: { decision: behavior === "allow" ? (legacy ? "approved" : "accept") : legacy ? "denied" : "decline" },
@@ -290,19 +321,26 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           try {
             msg = JSON.parse(line);
           } catch {
+            appendNative(threadId, { dir: "in", source: "codex.app-server.unparsed", msg: line.slice(0, 2000) });
             continue;
           }
           appendNative(threadId, { dir: "in", source: "codex.app-server", msg });
-          if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
-            const pend = rpcPending.get(msg.id);
-            if (pend) {
-              rpcPending.delete(msg.id);
-              msg.error ? pend.reject(new Error(msg.error.message ?? JSON.stringify(msg.error))) : pend.resolve(msg.result);
+          // a throw here would escape into the stdout 'data' event and take
+          // the whole server down; send() has already ended the turn
+          try {
+            if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+              const pend = rpcPending.get(msg.id);
+              if (pend) {
+                rpcPending.delete(msg.id);
+                msg.error ? pend.reject(new Error(msg.error.message ?? JSON.stringify(msg.error))) : pend.resolve(msg.result);
+              }
+            } else if (msg.id !== undefined && msg.method) {
+              handleServerRequest(msg);
+            } else if (msg.method) {
+              handleNotification(msg);
             }
-          } else if (msg.id !== undefined && msg.method) {
-            handleServerRequest(msg);
-          } else if (msg.method) {
-            handleNotification(msg);
+          } catch (e) {
+            console.error(`codex: handling ${msg.method ?? `response ${msg.id}`} failed —`, e);
           }
         }
       });
@@ -311,6 +349,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       child.stderr.on("data", (c) => {
         stderr += c;
         if (stderr.length > 8192) stderr = stderr.slice(-8192);
+      });
+      // writing to a dead child reports EPIPE asynchronously here, not as a
+      // throw; unhandled, this 'error' event would take the server down
+      child.stdin.on("error", (e) => {
+        if (state.settled) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message: `codex app-server stdin: ${e.message}` });
+        settle(false, "stdin_write_failed");
       });
       child.on("error", (e) => {
         emit({ ...base(threadId, turnId), type: "runtime.error", message: `spawn failed: ${e.message}` });

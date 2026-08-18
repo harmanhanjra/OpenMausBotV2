@@ -13,6 +13,8 @@ import type { ProviderInstance, RuntimeEvent, RuntimeEventListener } from "../co
 export class EventBus {
   private listeners = new Set<RuntimeEventListener>();
   private unsubscribes: Array<() => void> = [];
+  /** the event log fails per event; one line per process is enough */
+  private loggedWriteFailure = false;
 
   attach(instances: ProviderInstance[]) {
     for (const instance of instances) {
@@ -32,8 +34,13 @@ export class EventBus {
   publish(event: RuntimeEvent) {
     try {
       appendFileSync(join(EVENTS_DIR, `${event.threadId}.ndjson`), JSON.stringify(event) + "\n");
-    } catch {
-      /* logging must never take down the stream */
+    } catch (e) {
+      // logging must never take down the stream, but a log that stopped
+      // recording silently makes every later bug report unanswerable
+      if (!this.loggedWriteFailure) {
+        this.loggedWriteFailure = true;
+        console.error(`bus: cannot write the event log in ${EVENTS_DIR} (further failures are not repeated) —`, e);
+      }
     }
     for (const listener of [...this.listeners]) {
       try {

@@ -206,6 +206,32 @@ describe("harness HTTP API", () => {
     expect(after.body.profile).toEqual({ name: "Ada Lovelace", email: "Ada@Example.com" });
   });
 
+  it("reports a failed room turn in the room and leaves it unlocked", async () => {
+    // the fleet is one unavailable instance, so every member's turn fails —
+    // the room must say so and hand the composer back, never sit on busyBotId
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const group = (await api("POST", "/api/groups", { name: "Standup", memberIds: [bot.id] })).body.group;
+
+    expect((await api("POST", `/api/groups/${group.id}/messages`, { text: "morning" })).status).toBe(202);
+
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const room = (await api("GET", "/api/bots")).body.groups.find((g: { id: string }) => g.id === group.id);
+      const failure = room.messages.find(
+        (m: { kind: string; tool?: { name: string; ok: boolean } }) =>
+          m.kind === "activity" && m.tool?.ok === false && m.tool.name.includes("unavailable"),
+      );
+      if (failure && !room.busyBotId) break;
+      if (Date.now() > deadline) {
+        throw new Error(`room never reported the failure: ${JSON.stringify(room)}\nstderr: ${stderr.slice(-2000)}`);
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    expect((await api("DELETE", `/api/groups/${group.id}`)).status).toBe(200);
+    await api("DELETE", `/api/bots/${bot.id}`);
+  }, 15_000);
+
   it("404s unknown routes with the route in the error", async () => {
     const res = await api("GET", "/api/definitely-not-a-route");
     expect(res.status).toBe(404);

@@ -167,11 +167,29 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> | null }
         >();
 
+        // a failed stdin write means the agent never sees this message, so
+        // whatever waits on it would hang: report it and end the turn
         const send = (obj: unknown) => {
+          appendNative(threadId, { dir: "out", source: SOURCE, msg: obj });
           try {
             child.stdin.write(JSON.stringify(obj) + "\n");
-          } catch {}
-          appendNative(threadId, { dir: "out", source: SOURCE, msg: obj });
+          } catch (e) {
+            const message = `cannot write to ${DRIVER_KIND}: ${e instanceof Error ? e.message : String(e)}`;
+            if (!state.settled) {
+              emit({ ...base(threadId, turnId), type: "runtime.error", message });
+              settle(false, "stdin_write_failed");
+            }
+            throw new Error(message, { cause: e });
+          }
+        };
+        // replies and notifications have nobody waiting on the throw; send()
+        // has already reported and settled, so never crash a timer or stream
+        const sendBestEffort = (obj: unknown) => {
+          try {
+            send(obj);
+          } catch (e) {
+            console.error(`${DRIVER_KIND}: dropped an outbound message —`, e);
+          }
         };
         const request = (method: string, params: unknown, timeoutMs?: number) =>
           new Promise<any>((resolve, reject) => {
@@ -185,7 +203,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               timer.unref?.();
             }
             rpcPending.set(id, { resolve, reject, timer });
-            send({ jsonrpc: "2.0", id, method, params });
+            try {
+              send({ jsonrpc: "2.0", id, method, params });
+            } catch (e) {
+              rpcPending.delete(id);
+              if (timer) clearTimeout(timer);
+              reject(e instanceof Error ? e : new Error(String(e)));
+            }
           });
 
         const stop = () => killCliTree(child);
@@ -194,7 +218,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           if (state.settled) return;
           state.settled = true;
           if (interruptTimer) clearTimeout(interruptTimer);
-          for (const finish of [...asks.values()]) finish("cancel");
+          for (const finish of [...asks.values()]) {
+            try {
+              finish("cancel");
+            } catch (e) {
+              console.error(`${DRIVER_KIND}: could not cancel a pending request while settling —`, e);
+            }
+          }
           for (const p of rpcPending.values()) {
             if (p.timer) clearTimeout(p.timer);
             p.reject(new Error("turn settled"));
@@ -212,7 +242,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const handleServerRequest = (msg: any) => {
           if (msg.method !== "session/request_permission") {
             // never leave an unknown server request hanging — the agent blocks
-            return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });
+            return sendBestEffort({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });
           }
           const params = msg.params ?? {};
           const options: Array<{ optionId?: string; kind?: string }> = Array.isArray(params.options) ? params.options : [];
@@ -230,7 +260,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           if (config.fullAuto) {
             const allow = optionFor("allow");
             if (!allow) missing("allow");
-            return send({
+            return sendBestEffort({
               jsonrpc: "2.0",
               id: msg.id,
               result: allow ? { outcome: { outcome: "selected", optionId: allow } } : cancelled,
@@ -246,7 +276,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             const want = behavior === "allow" ? "allow" : "reject";
             const optionId = behavior === "cancel" ? null : optionFor(want);
             if (behavior !== "cancel" && !optionId) missing(want);
-            send({
+            sendBestEffort({
               jsonrpc: "2.0",
               id: msg.id,
               result: optionId ? { outcome: { outcome: "selected", optionId } } : cancelled,
@@ -335,6 +365,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             try {
               msg = JSON.parse(line);
             } catch {
+              appendNative(threadId, { dir: "in", source: `${SOURCE}.unparsed`, msg: line.slice(0, 2000) });
               continue;
             }
             appendNative(threadId, { dir: "in", source: SOURCE, msg });
@@ -348,7 +379,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             } else if (msg.id !== undefined && msg.method) {
               handleServerRequest(msg);
             } else if (msg.method) {
-              handleNotification(msg);
+              // a throw here would escape into the stdout 'data' event and
+              // take the process down
+              try {
+                handleNotification(msg);
+              } catch (e) {
+                console.error(`${DRIVER_KIND}: handling ${msg.method} failed —`, e);
+              }
             }
           }
         });
@@ -357,6 +394,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         child.stderr.on("data", (c) => {
           stderr += c;
           if (stderr.length > 8192) stderr = stderr.slice(-8192);
+        });
+        // writing to a dead agent reports EPIPE asynchronously here, not as
+        // a throw; unhandled, this 'error' event would take the server down
+        child.stdin.on("error", (e) => {
+          if (state.settled) return;
+          emit({ ...base(threadId, turnId), type: "runtime.error", message: `${DRIVER_KIND} stdin: ${e.message}` });
+          settle(false, "stdin_write_failed");
         });
         child.on("error", (e) => {
           emit({ ...base(threadId, turnId), type: "runtime.error", message: `spawn failed: ${e.message}` });
@@ -374,8 +418,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         });
 
         const interrupt = () => {
-          if (sessionId) send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
-          else stop();
+          // if cancel cannot be delivered, kill the process rather than wait
+          // out the 5s timer on an agent that never heard us
+          if (sessionId) {
+            try {
+              send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
+            } catch {
+              stop();
+            }
+          } else stop();
           if (interruptTimer) clearTimeout(interruptTimer);
           interruptTimer = setTimeout(() => settle(true, "cancelled"), 5_000);
           interruptTimer.unref?.();

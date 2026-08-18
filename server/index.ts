@@ -2,7 +2,7 @@
 // (upstream rule): the React app dispatches typed commands over HTTP and
 // folds one SSE event stream; every provider process runs here.
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import { dirname, extname, join } from "node:path";
@@ -14,6 +14,7 @@ import { ensureDirs, instanceConfigs, loadConfig, saveConfig, EVENTS_DIR, NATIVE
 import type { RuntimeEvent } from "./contracts.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
+import { isMissing, removeFile } from "./fs-safe.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
 import { mentionedBots, Store, type Message } from "./store.ts";
@@ -256,11 +257,15 @@ const screenPollers = new Map<
  * and never two in flight. */
 const SCREEN_POLL_MS = 6000;
 const SCREEN_MIN_GAP_MS = 3000;
+const SCREEN_MISS_REPORT_AFTER = 3;
 
 function startScreenPoller(botId: string, boxId?: string) {
   if (screenPollers.has(botId) || !box.boxConfigured(cfg)) return;
   let inFlight = false;
   let lastAt = 0;
+  // a single miss is routine (box asleep or mid-command); a run of them
+  // means the preview is dead, which is worth one line in the log
+  let misses = 0;
   const capture = async () => {
     if (inFlight || Date.now() - lastAt < SCREEN_MIN_GAP_MS) return;
     inFlight = true;
@@ -271,8 +276,11 @@ function startScreenPoller(botId: string, boxId?: string) {
       const frame = { png, mime: format === "jpeg" ? "image/jpeg" : "image/png" };
       entry.last = frame;
       broadcast({ kind: "screen", botId, ...frame });
-    } catch {
-      /* box asleep or mid-command — try again next tick */
+      misses = 0;
+    } catch (e) {
+      if (++misses === SCREEN_MISS_REPORT_AFTER) {
+        console.error(`screen: ${misses} failed captures in a row for bot ${botId} —`, e);
+      }
     } finally {
       lastAt = Date.now();
       inFlight = false;
@@ -322,13 +330,15 @@ function userDataRoot(): string {
 function readCuaConnection(): { command: string; args: string[]; env: Record<string, string> } | null {
   // new name first; pre-rename desktop builds used the old directory
   for (const dir of ["OpenMausBot", "openmausbot", "OpenGrokBot", "opengrokbot"]) {
+    const p = join(userDataRoot(), dir, "cua-connection.json");
     try {
-      const p = join(userDataRoot(), dir, "cua-connection.json");
       const conn = JSON.parse(readFileSync(p, "utf8"));
       if (!conn || conn.mode === "unavailable" || !conn.mcpCommand) continue;
       return { command: conn.mcpCommand, args: conn.mcpArgs ?? ["mcp"], env: conn.mcpEnv ?? {} };
-    } catch {
-      /* try the next location */
+    } catch (e) {
+      // absent is the normal case (no desktop shell running); anything
+      // else means the local computer is silently off for a real reason
+      if (!isMissing(e)) console.error(`cua: unusable connection file at ${p} —`, e);
     }
   }
   return null;
@@ -494,6 +504,8 @@ async function startTurn(
       if (previewBoxId) startScreenPoller(bot.id, previewBoxId);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
+      // the chat chip is truncated — the log keeps the whole failure
+      console.error(`turn: bot ${bot.id} failed to dispatch —`, e);
       const failure = store.appendMessage(bot.threadId, {
         role: "bot",
         kind: "activity",
@@ -531,6 +543,21 @@ function broadcastGroup(groupId: string) {
   if (group) broadcast({ kind: "group", group });
 }
 
+/** Surface a room-level failure in the room itself and unlock its composer. */
+function reportGroupFailure(groupId: string, e: unknown) {
+  const group = store.group(groupId);
+  if (!group) return;
+  const message = e instanceof Error ? e.message : String(e);
+  const failure = store.appendMessage(group.threadId, {
+    role: "bot",
+    kind: "activity",
+    tool: { name: `error: ${message.slice(0, 160)}`, ok: false },
+  });
+  broadcast({ kind: "message", threadId: group.threadId, message: failure });
+  store.patchGroup(group.id, { busyBotId: null });
+  broadcastGroup(group.id);
+}
+
 async function runGroupMemberTurn(
   groupId: string,
   botId: string,
@@ -559,6 +586,13 @@ async function runGroupMemberTurn(
   store.patchGroup(group.id, { busyBotId: bot.id });
   broadcastGroup(group.id);
   groupSpeakers.set(group.threadId, { botId: bot.id, name: bot.name, color: bot.color });
+  // whatever happens below, the room must not stay stuck on this speaker:
+  // busyBotId locks the room's composer for every client
+  const releaseRoom = () => {
+    groupSpeakers.delete(group.threadId);
+    store.patchGroup(group.id, { busyBotId: null, unread: true });
+    broadcastGroup(group.id);
+  };
 
   const roster = group.memberIds
     .map((id) => store.bot(id))
@@ -581,37 +615,39 @@ async function runGroupMemberTurn(
   // run the turn and wait for it to settle, folding the reply text so a
   // chained @mention can be routed afterwards
   let replyText = "";
-  await new Promise<void>((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      unsub();
-      resolve();
-    };
-    const unsub = bus.subscribe((e: RuntimeEvent) => {
-      if (e.threadId !== group.threadId) return;
-      if (e.type === "item.completed" && e.itemType === "assistant_text") replyText += `\n${e.text}`;
-      else if (e.type === "turn.completed") finish();
-    });
-    const timer = setTimeout(finish, 5 * 60_000);
-    instance.adapter
-      .sendTurn({ threadId: group.threadId, text, system, model: bot.modelSelection.model })
-      .catch((err) => {
-        const failure = store.appendMessage(group.threadId, {
-          role: "bot",
-          kind: "activity",
-          from: { botId: bot.id, name: bot.name, color: bot.color },
-          tool: { name: `error: ${err instanceof Error ? err.message.slice(0, 140) : "turn failed"}`, ok: false },
-        });
-        broadcast({ kind: "message", threadId: group.threadId, message: failure });
-        finish();
+  try {
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        unsub();
+        resolve();
+      };
+      const unsub = bus.subscribe((e: RuntimeEvent) => {
+        if (e.threadId !== group.threadId) return;
+        if (e.type === "item.completed" && e.itemType === "assistant_text") replyText += `\n${e.text}`;
+        else if (e.type === "turn.completed") finish();
       });
-  });
-  groupSpeakers.delete(group.threadId);
-  store.patchGroup(group.id, { busyBotId: null, unread: true });
-  broadcastGroup(group.id);
+      const timer = setTimeout(finish, 5 * 60_000);
+      instance.adapter
+        .sendTurn({ threadId: group.threadId, text, system, model: bot.modelSelection.model })
+        .catch((err) => {
+          console.error(`group ${group.id}: ${bot.name}'s turn failed to dispatch —`, err);
+          const failure = store.appendMessage(group.threadId, {
+            role: "bot",
+            kind: "activity",
+            from: { botId: bot.id, name: bot.name, color: bot.color },
+            tool: { name: `error: ${err instanceof Error ? err.message.slice(0, 140) : "turn failed"}`, ok: false },
+          });
+          broadcast({ kind: "message", threadId: group.threadId, message: failure });
+          finish();
+        });
+    });
+  } finally {
+    releaseRoom();
+  }
 
   // chained mentions: a member's reply can summon teammates — one hop only
   if (hop < MAX_GROUP_HOPS && replyText.trim()) {
@@ -656,7 +692,15 @@ function startGroupTurn(groupId: string, text: string) {
       await runGroupMemberTurn(groupId, responder.id, 0, spoken);
     }
   });
-  groupQueues.set(groupId, next.catch(() => {}));
+  // the queue must survive a failed turn, but the failure itself belongs in
+  // the room (and the log) — swallowing it left the room silent forever
+  groupQueues.set(
+    groupId,
+    next.catch((e) => {
+      console.error(`group ${groupId}: turn failed —`, e);
+      reportGroupFailure(groupId, e);
+    }),
+  );
 }
 
 function configStatus() {
@@ -816,7 +860,11 @@ const server = createServer(async (req, res) => {
       const keepalive = setInterval(() => {
         try {
           res.write(": keepalive\n\n");
-        } catch {}
+        } catch {
+          // the client vanished without a close event — stop polling it
+          clearInterval(keepalive);
+          sseClients.delete(res);
+        }
       }, 25_000);
       req.on("close", () => {
         clearInterval(keepalive);
@@ -874,11 +922,7 @@ const server = createServer(async (req, res) => {
       const group = store.group(m[1]);
       if (!group) return json(res, 404, { error: "no such room" });
       store.deleteGroup(group.id);
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
-        try {
-          unlinkSync(join(dir, `${group.threadId}.ndjson`));
-        } catch {}
-      }
+      for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeFile(join(dir, `${group.threadId}.ndjson`), "event log");
       broadcast({ kind: "group.deleted", groupId: group.id });
       return json(res, 200, { ok: true });
     }
@@ -896,7 +940,11 @@ const server = createServer(async (req, res) => {
       if (!group) return json(res, 404, { error: "no such room" });
       const busy = group.busyBotId ? store.bot(group.busyBotId) : undefined;
       const instance = busy ? registry.get(busy.modelSelection.instanceId) : undefined;
-      await instance?.adapter.interruptTurn(group.threadId).catch(() => {});
+      // best-effort: the turn may have settled between the click and here,
+      // but a driver that cannot be interrupted must not do it silently
+      await instance?.adapter
+        .interruptTurn(group.threadId)
+        .catch((e) => console.error(`group ${group.id}: interrupt failed —`, e));
       return json(res, 200, { ok: true });
     }
 
@@ -938,15 +986,15 @@ const server = createServer(async (req, res) => {
     if (m && method === "DELETE") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      // a running turn dies with its bot
-      await registry.get(bot.modelSelection.instanceId)?.adapter.interruptTurn(bot.threadId).catch(() => {});
+      // a running turn dies with its bot; the delete still goes through if
+      // the interrupt cannot be delivered, but the reason gets logged
+      await registry
+        .get(bot.modelSelection.instanceId)
+        ?.adapter.interruptTurn(bot.threadId)
+        .catch((e) => console.error(`bot ${bot.id}: interrupt before delete failed —`, e));
       stopScreenPoller(bot.id);
       store.deleteBot(bot.id);
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
-        try {
-          unlinkSync(join(dir, `${bot.threadId}.ndjson`));
-        } catch {}
-      }
+      for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeFile(join(dir, `${bot.threadId}.ndjson`), "event log");
       broadcast({ kind: "bot.deleted", botId: bot.id });
       return json(res, 200, { ok: true });
     }
@@ -1130,21 +1178,31 @@ const server = createServer(async (req, res) => {
         const data = readFileSync(file);
         res.writeHead(200, { "content-type": MIME[extname(file)] ?? "application/octet-stream" });
         return res.end(data);
-      } catch {
-        // SPA fallback
+      } catch (e) {
+        // a client-side route has no file of its own — that's the SPA
+        // fallback below. An unreadable file is a broken install, not a route.
+        if (!isMissing(e)) console.error(`static: cannot read ${file} —`, e);
         try {
           const data = readFileSync(join(STATIC_DIR, "index.html"));
           res.writeHead(200, { "content-type": "text/html" });
           return res.end(data);
-        } catch {
-          /* fall through to 404 */
+        } catch (fallbackError) {
+          console.error(`static: no index.html in ${STATIC_DIR} —`, fallbackError);
         }
       }
     }
 
     return json(res, 404, { error: `no route: ${method} ${path}` });
   } catch (e) {
+    // a response already on the wire (SSE, a static file) cannot carry an
+    // error body: writing one throws again and takes the request handler's
+    // promise down as an unhandled rejection
+    if (res.headersSent) {
+      console.error(`${method} ${path} failed after the response started —`, e);
+      return res.destroy();
+    }
     const status = (e as any)?.status ?? 500;
+    if (status >= 500) console.error(`${method} ${path} failed —`, e);
     return json(res, status, { error: e instanceof Error ? e.message : String(e) });
   }
 });

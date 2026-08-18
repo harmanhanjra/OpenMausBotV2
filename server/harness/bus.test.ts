@@ -3,7 +3,7 @@
 // neither logging nor a broken listener may take down the stream.
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { EVENTS_DIR, ensureDirs } from "../config.ts";
 import type { RuntimeEvent } from "../contracts.ts";
@@ -73,15 +73,22 @@ describe("EventBus", () => {
     expect(logged[0].type).toBe("turn.started");
   });
 
-  it("still delivers when the NDJSON log cannot be written", () => {
+  it("still delivers when the NDJSON log cannot be written, and says so once", () => {
     rmSync(EVENTS_DIR, { recursive: true, force: true });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     const bus = new EventBus();
     const seen: RuntimeEvent[] = [];
     bus.subscribe((e) => seen.push(e));
 
     bus.publish(testEvent());
-    expect(seen).toHaveLength(1);
+    bus.publish(testEvent());
+    expect(seen).toHaveLength(2);
     expect(existsSync(EVENTS_DIR)).toBe(false);
+    // a log that stopped recording must be visible — but one line, not one
+    // per event
+    expect(errors).toHaveBeenCalledTimes(1);
+    expect(errors.mock.calls[0][0]).toContain("cannot write the event log");
+    errors.mockRestore();
   });
 
   it("a throwing listener does not starve the others", () => {

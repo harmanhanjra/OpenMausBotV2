@@ -8,7 +8,7 @@
 //   - Composio Connect (connected apps → tools) over streamable HTTP
 //   - the bot's cloud computer (box.ascii.dev) via server/computer-proxy.ts
 //     — screenshot/exec/open_url, the CUA-on-the-box bridge
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import { DATA_DIR } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
+import { removeFile } from "../fs-safe.ts";
 import { brokerSocketPath, execCli, killCliTree, spawnCli } from "../procs.ts";
 
 import type {
@@ -98,13 +99,13 @@ function createPermissionBroker(opts: {
   socketPath: string;
   onAsk: (ask: Ask) => void;
   onResolve: (resolved: Ask & { behavior: string; source: string }) => void;
+  /** the broker is unusable: every ask this turn will hit the timeout */
+  onBrokenBroker: (message: string) => void;
   timeoutMs?: number;
 }) {
   const timeoutMs = opts.timeoutMs ?? 15 * 60_000;
   const pending = new Map<string, { ask: Ask; finish: (behavior: string, message: string | undefined, source: string) => void }>();
-  try {
-    unlinkSync(opts.socketPath);
-  } catch {}
+  removeFile(opts.socketPath, "claude broker");
   const server = createNetServer((conn) => {
     conn.on("error", () => {});
     let buf = "";
@@ -129,7 +130,13 @@ function createPermissionBroker(opts: {
           clearTimeout(timer);
           try {
             conn.write(JSON.stringify({ t: "answer", id: askId, behavior, message }) + "\n");
-          } catch {}
+          } catch (e) {
+            // the CLI never hears the decision: it sits on this tool call
+            // until its own timeout, so say so instead of looking answered
+            opts.onBrokenBroker(
+              `the answer to "${ask.tool}" could not be delivered (${e instanceof Error ? e.message : String(e)})`,
+            );
+          }
           opts.onResolve({ ...ask, behavior, source });
         };
         const timer = setTimeout(
@@ -145,7 +152,11 @@ function createPermissionBroker(opts: {
       }
     });
   });
-  server.on("error", () => {});
+  // without the socket the CLI's asks never arrive: every permission this
+  // turn silently waits out its timeout and then denies
+  server.on("error", (e) =>
+    opts.onBrokenBroker(`the permission broker socket failed (${e.message}) — approvals cannot reach you this turn`),
+  );
   server.listen(opts.socketPath);
   return {
     answer(askId: string, behavior: string, message?: string): boolean {
@@ -163,10 +174,10 @@ function createPermissionBroker(opts: {
       }
       try {
         server.close();
-      } catch {}
-      try {
-        unlinkSync(opts.socketPath);
-      } catch {}
+      } catch (e) {
+        console.error("claude broker: close failed —", e);
+      }
+      removeFile(opts.socketPath, "claude broker");
     },
   };
 }
@@ -304,6 +315,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               behavior: resolved.behavior,
               source: resolved.source,
             }),
+          onBrokenBroker: (message) =>
+            emit({ ...base(threadId, turnId), type: "runtime.error", message: `permissions: ${message}` }),
         });
         args.push("--permission-prompt-tool", "mcp__ogb__approve");
         mcpServers.ogb = { command: process.execPath, args: [PERM_PROXY_PATH, socketPath], env: { ...NODE_ENV_FLAG } };
@@ -346,6 +359,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         try {
           o = JSON.parse(line);
         } catch {
+          // the CLI interleaves plain-text notices with its JSON stream;
+          // keep the raw line in the native log instead of dropping it
+          appendNative(threadId, { dir: "in", source: "claude.stdout.unparsed", msg: line.slice(0, 2000) });
           return;
         }
         appendNative(threadId, { dir: "in", source: "claude.sdk.message", msg: o });
@@ -448,11 +464,19 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       active.set(threadId, { stop, turnId, broker });
       emit({ ...base(threadId, turnId), type: "turn.started" });
 
+      // an EPIPE on a CLI that died arrives as an 'error' event on the pipe,
+      // which is otherwise unhandled and takes the whole server down
+      child.stdin.on("error", (e) => {
+        if (settled) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message: `cannot write the prompt to claude: ${e.message}` });
+        settle(false, "stdin_write_failed");
+      });
+
       // prompt over stdin as a stream-json message — never argv (ARG_MAX)
       const promptMsg = { type: "user", message: { role: "user", content: turn.text } };
+      appendNative(threadId, { dir: "out", source: "claude.sdk.message", msg: promptMsg });
       child.stdin.write(JSON.stringify(promptMsg) + "\n");
       child.stdin.end();
-      appendNative(threadId, { dir: "out", source: "claude.sdk.message", msg: promptMsg });
 
       return { turnId };
     };

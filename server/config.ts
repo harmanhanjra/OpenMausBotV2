@@ -1,9 +1,11 @@
 // Config + data dirs. One file, ~/.openmausbot/config.json, env fallbacks:
 //   { "xai": {"key":"xai-…"}, "composio": {"key":"ck_…"}, "box": {"token":"…"},
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
+import { writeFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+import { readJsonFile } from "./fs-safe.ts";
 
 import type { InstanceConfigMap } from "./contracts.ts";
 
@@ -35,20 +37,19 @@ export function ensureDirs() {
   if (!existsSync(DATA_DIR) && existsSync(LEGACY_DATA_DIR)) {
     try {
       renameSync(LEGACY_DATA_DIR, DATA_DIR);
-    } catch {
-      /* cross-device or busy — fall through to a fresh dir */
+    } catch (e) {
+      // cross-device or busy — fall through to a fresh dir, but say so:
+      // the user's whole fleet appears to have vanished otherwise
+      console.error(`config: could not migrate ${LEGACY_DATA_DIR} to ${DATA_DIR}, starting fresh —`, e);
     }
   }
   for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true });
 }
 
 export function loadConfig(): AppConfig {
-  let cfg: AppConfig = {};
-  try {
-    cfg = JSON.parse(readFileSync(join(DATA_DIR, "config.json"), "utf8"));
-  } catch {
-    /* first run — env fallbacks below */
-  }
+  // a missing file is the first run (env fallbacks below); an unreadable one
+  // must not masquerade as "no keys configured"
+  const cfg: AppConfig = readJsonFile<AppConfig>(join(DATA_DIR, "config.json"), "config") ?? {};
   cfg.xai = { key: process.env.XAI_API_KEY, ...cfg.xai };
   cfg.nvidia = { key: process.env.NVIDIA_API_KEY, ...cfg.nvidia };
   cfg.composio = { key: process.env.COMPOSIO_KEY, ...cfg.composio };
@@ -60,12 +61,9 @@ export function loadConfig(): AppConfig {
  * echoed back — callers report configured-or-not booleans only). */
 export function saveConfig(patch: Partial<AppConfig>): void {
   const p = join(DATA_DIR, "config.json");
-  let disk: Record<string, unknown> = {};
-  try {
-    disk = JSON.parse(readFileSync(p, "utf8"));
-  } catch {
-    /* first write */
-  }
+  // this write replaces the file wholesale: reading it as empty because it
+  // could not be parsed would drop every key the user already stored
+  const disk: Record<string, unknown> = readJsonFile<Record<string, unknown>>(p, "config") ?? {};
   for (const key of ["xai", "nvidia", "composio", "box", "profile"] as const) {
     if (patch[key] && typeof patch[key] === "object") {
       disk[key] = { ...(disk[key] as object), ...patch[key] };

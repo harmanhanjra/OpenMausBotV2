@@ -1,7 +1,7 @@
 // Store persistence contract: bots.json + messages-<threadId>.json are
 // the durable record — everything here must survive a process restart
 // except `busy`, which never does (no turn survives one either).
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -178,6 +178,30 @@ describe("Store", () => {
 
     const reloaded = new Store(selection);
     expect(reloaded.bots).toEqual([]);
+  });
+
+  it("keeps a copy of a corrupt bots.json instead of overwriting it", () => {
+    const store = new Store(selection);
+    store.createBot();
+    writeFileSync(join(DATA_DIR, "bots.json"), "{not json");
+
+    // starting empty is fine; the next createBot rewriting bots.json over
+    // the only record of the user's fleet is not
+    const reloaded = new Store(selection);
+    reloaded.createBot();
+    const preserved = readdirSync(DATA_DIR).filter((f) => f.startsWith("bots.json.corrupt-"));
+    expect(preserved).toHaveLength(1);
+    expect(readFileSync(join(DATA_DIR, preserved[0]), "utf8")).toBe("{not json");
+  });
+
+  it("refuses to start with an unreadable bots.json rather than resetting the fleet", () => {
+    new Store(selection).createBot();
+    // a directory where the file belongs: unreadable, but definitely not
+    // "no bots yet" — silently starting empty would strand the real file
+    rmSync(join(DATA_DIR, "bots.json"));
+    mkdirSync(join(DATA_DIR, "bots.json"));
+
+    expect(() => new Store(selection)).toThrow(/cannot read/);
   });
 
   it("busy is wiped even when bots.json says otherwise", () => {

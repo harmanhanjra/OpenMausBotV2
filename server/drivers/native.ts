@@ -7,13 +7,22 @@ import { join } from "node:path";
 
 import { NATIVE_DIR } from "../config.ts";
 
+// the tee fails once per message; one line per process keeps the reason
+// visible without drowning the log it is complaining about
+let loggedWriteFailure = false;
+
 export function appendNative(threadId: string, entry: { dir: "in" | "out"; source: string; msg: unknown }) {
   try {
     appendFileSync(
       join(NATIVE_DIR, `${threadId}.ndjson`),
       JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\n",
     );
-  } catch {
-    /* never let logging break a run */
+  } catch (e) {
+    // never let logging break a run — but a tee that silently stopped
+    // recording makes protocol drift undiagnosable
+    if (!loggedWriteFailure) {
+      loggedWriteFailure = true;
+      console.error(`native log: cannot write in ${NATIVE_DIR} (further failures are not repeated) —`, e);
+    }
   }
 }
