@@ -938,3 +938,14 @@ export function formatTime(at: number) {
     minute: "2-digit",
   });
 }
+
+/** "Today" / "Yesterday" / "Mon, Jan 5" — the day separator in a transcript. */
+export function dayLabel(at: number): string {
+  const d = new Date(at);
+  const now = new Date();
+  const startOfDay = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diffDays = Math.round((startOfDay(now) - startOfDay(d)) / 86_400_000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  return d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+}

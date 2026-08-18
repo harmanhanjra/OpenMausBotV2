@@ -11,19 +11,20 @@
 // and falls back to a fresh thread/start.
 import { homedir } from "node:os";
 
-import { execCli, killCliTree, spawnCli } from "../procs.ts";
+import { onJsonLines } from "../lines.ts";
+import { killCliTree, spawnCli } from "../procs.ts";
 
 import type {
   DriverCreateInput,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
-  RuntimeEvent,
-  RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
-import { newEventId, newId } from "../contracts.ts";
+import { newId } from "../contracts.ts";
 import { augmentedPath } from "../env-path.ts";
+import { probeCliVersion, trackStderr } from "./cli.ts";
+import { createEventHub } from "./events.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "codex";
@@ -64,24 +65,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
 
   async create(input: DriverCreateInput<CodexConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
-    const listeners = new Set<RuntimeEventListener>();
+    const hub = createEventHub(DRIVER_KIND);
+    const { emit, base } = hub;
     interface Turn {
       stop: () => void;
       turnId: string;
       asks: Map<string, (behavior: string, message?: string) => void>;
     }
     const active = new Map<string, Turn>();
-
-    const emit = (event: RuntimeEvent) => {
-      for (const l of [...listeners]) l(event);
-    };
-    const base = (threadId: string, turnId: string) => ({
-      eventId: newEventId(),
-      provider: DRIVER_KIND,
-      threadId,
-      turnId,
-      createdAt: new Date().toISOString(),
-    });
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
@@ -278,40 +269,22 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         }
       };
 
-      let buf = "";
-      child.stdout.on("data", (chunk) => {
-        buf += chunk;
-        let nl;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
-          if (!line.trim()) continue;
-          let msg: any;
-          try {
-            msg = JSON.parse(line);
-          } catch {
-            continue;
+      onJsonLines(child.stdout, (msg) => {
+        appendNative(threadId, { dir: "in", source: "codex.app-server", msg });
+        if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+          const pend = rpcPending.get(msg.id);
+          if (pend) {
+            rpcPending.delete(msg.id);
+            msg.error ? pend.reject(new Error(msg.error.message ?? JSON.stringify(msg.error))) : pend.resolve(msg.result);
           }
-          appendNative(threadId, { dir: "in", source: "codex.app-server", msg });
-          if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
-            const pend = rpcPending.get(msg.id);
-            if (pend) {
-              rpcPending.delete(msg.id);
-              msg.error ? pend.reject(new Error(msg.error.message ?? JSON.stringify(msg.error))) : pend.resolve(msg.result);
-            }
-          } else if (msg.id !== undefined && msg.method) {
-            handleServerRequest(msg);
-          } else if (msg.method) {
-            handleNotification(msg);
-          }
+        } else if (msg.id !== undefined && msg.method) {
+          handleServerRequest(msg);
+        } else if (msg.method) {
+          handleNotification(msg);
         }
       });
 
-      let stderr = "";
-      child.stderr.on("data", (c) => {
-        stderr += c;
-        if (stderr.length > 8192) stderr = stderr.slice(-8192);
-      });
+      const stderrTail = trackStderr(child);
       child.on("error", (e) => {
         emit({ ...base(threadId, turnId), type: "runtime.error", message: `spawn failed: ${e.message}` });
         settle(false, "spawn_error");
@@ -321,7 +294,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           emit({
             ...base(threadId, turnId),
             type: "runtime.error",
-            message: `codex exited ${code} before turn/completed${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`,
+            message: `codex exited ${code} before turn/completed${stderrTail() ? `: ${stderrTail().trim().slice(-300)}` : ""}`,
           });
           settle(false, "exit_before_result");
         }
@@ -374,11 +347,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env: { ...process.env, PATH: augmentedPath() } }, (err, stdout) =>
-          resolve(err ? null : stdout.trim()),
-        );
-      });
+      const version = await probeCliVersion(config.cli);
       if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
       return { state: "available", version };
     };
@@ -405,14 +374,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         stopAll: async () => {
           for (const { stop } of active.values()) stop();
         },
-        onEvent: (listener) => {
-          listeners.add(listener);
-          return () => listeners.delete(listener);
-        },
+        onEvent: hub.onEvent,
       },
       dispose: async () => {
         for (const { stop } of active.values()) stop();
-        listeners.clear();
+        hub.clear();
       },
     };
   },

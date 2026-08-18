@@ -23,11 +23,12 @@ import type {
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
-  RuntimeEvent,
-  RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
-import { newEventId, newId } from "../contracts.ts";
+import { newId } from "../contracts.ts";
+import { onLines } from "../lines.ts";
+import { probeCliVersion, trackStderr } from "./cli.ts";
+import { createEventHub } from "./events.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "antigravityAgent";
@@ -80,17 +81,14 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
 
   async create(input: DriverCreateInput<AntigravityConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
-    const listeners = new Set<RuntimeEventListener>();
+    const hub = createEventHub(DRIVER_KIND);
+    const { emit, base } = hub;
     // one active turn per thread; a second send while busy is a caller bug
     const active = new Map<string, { stop: () => void; turnId: string }>();
     // every live agy child, tracked independently of `active`: a child can
     // hang AFTER emitting `result` (so it's already removed from `active`), and
     // dispose()/stopAll() must still be able to reap it. Removed on process exit.
     const children = new Set<ChildProcess>();
-
-    const emit = (event: RuntimeEvent) => {
-      for (const l of [...listeners]) l(event);
-    };
 
     // Reap every tracked child's tree (mirrors the per-turn stop()) — POSIX
     // process group on mac/linux, taskkill /T on Windows. When escalate is
@@ -108,13 +106,6 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         }
       }
     };
-    const base = (threadId: string, turnId: string) => ({
-      eventId: newEventId(),
-      provider: DRIVER_KIND,
-      threadId,
-      turnId,
-      createdAt: new Date().toISOString(),
-    });
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
@@ -255,23 +246,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         }
       };
 
-      let buf = "";
       child.stdout.setEncoding("utf8"); // decode multibyte across chunk splits
-      child.stdout.on("data", (chunk) => {
-        buf += chunk;
-        let nl;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
-          if (line.trim()) handleLine(line);
-        }
-      });
-
-      let stderr = "";
-      child.stderr.on("data", (c) => {
-        stderr += c;
-        if (stderr.length > 8192) stderr = stderr.slice(-8192);
-      });
+      onLines(child.stdout, handleLine);
+      const stderrTail = trackStderr(child);
 
       child.on("error", (e) => {
         emit({ ...base(threadId, turnId), type: "runtime.error", message: `spawn failed: ${e.message}` });
@@ -284,7 +261,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           emit({
             ...base(threadId, turnId),
             type: "runtime.error",
-            message: `agy exited ${code} before result${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`,
+            message: `agy exited ${code} before result${stderrTail() ? `: ${stderrTail().trim().slice(-300)}` : ""}`,
           });
           settle(false, "exit_before_result");
         }
@@ -310,11 +287,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env: { ...process.env, PATH: augmentedPath() } }, (err, stdout) =>
-          resolve(err ? null : stdout.trim()),
-        );
-      });
+      const version = await probeCliVersion(config.cli);
       if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
       // No auth field: agy auth is keyring-backed with no reliable file marker
       // (~/.gemini/antigravity-cli/ exists after first run even when logged
@@ -344,10 +317,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           for (const { stop } of active.values()) stop();
           reapChildren(false); // also reap children that hung post-result
         },
-        onEvent: (listener) => {
-          listeners.add(listener);
-          return () => listeners.delete(listener);
-        },
+        onEvent: hub.onEvent,
       },
       generateText: (prompt: string) =>
         new Promise((resolve, reject) => {
@@ -361,7 +331,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       dispose: async () => {
         for (const { stop } of active.values()) stop();
         reapChildren(true); // escalate to SIGKILL — disposal must reap every child
-        listeners.clear();
+        hub.clear();
       },
     };
   },

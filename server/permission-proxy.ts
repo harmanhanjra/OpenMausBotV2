@@ -14,6 +14,9 @@
 import { connect } from "node:net";
 import { randomUUID } from "node:crypto";
 
+import { onJsonLines } from "./lines.ts";
+import { send, serveMcpStdio } from "./mcp-stdio.ts";
+
 const socketPath = process.argv[2] ?? "";
 
 const waiting = new Map<string, (msg: any) => void>();
@@ -27,27 +30,11 @@ const dead = () => {
 conn.on("error", dead);
 conn.on("close", dead);
 
-let connBuf = "";
-conn.on("data", (chunk) => {
-  connBuf += chunk;
-  let nl;
-  while ((nl = connBuf.indexOf("\n")) !== -1) {
-    const line = connBuf.slice(0, nl);
-    connBuf = connBuf.slice(nl + 1);
-    let msg: any;
-    try {
-      msg = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (msg.t === "answer") {
-      waiting.get(msg.id)?.(msg);
-      waiting.delete(msg.id);
-    }
-  }
+onJsonLines(conn, (msg) => {
+  if (msg.t !== "answer") return;
+  waiting.get(msg.id)?.(msg);
+  waiting.delete(msg.id);
 });
-
-const send = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
 
 const TOOLS = [
   {
@@ -82,24 +69,12 @@ const TOOLS = [
   },
 ];
 
-async function handle(msg: any) {
-  if (msg.method === "initialize") {
-    return send({
-      jsonrpc: "2.0",
-      id: msg.id,
-      result: {
-        protocolVersion: msg.params?.protocolVersion ?? "2024-11-05",
-        capabilities: { tools: {} },
-        serverInfo: { name: "openmausbot-permissions", version: "1" },
-      },
-    });
-  }
-  if (msg.method === "tools/list") return send({ jsonrpc: "2.0", id: msg.id, result: { tools: TOOLS } });
-  if (msg.method === "tools/call") {
-    const name = msg.params?.name;
-    const args = msg.params?.arguments ?? {};
+serveMcpStdio({
+  name: "openmausbot-permissions",
+  version: "1",
+  tools: TOOLS,
+  async call(id, name, args) {
     const askId = randomUUID();
-    const isQuestion = name === "ask_user";
     // the CLI may include its own suggested permission rules; on allow we
     // hand them straight back as updatedPermissions so claude stops asking
     // at its own layer — no invented rule syntax (agentcal)
@@ -108,6 +83,7 @@ async function handle(msg: any) {
       : Array.isArray(args.suggestions)
         ? args.suggestions
         : null;
+    const isQuestion = name === "ask_user";
     const answer: any = await new Promise((resolve) => {
       waiting.set(askId, resolve);
       if (conn.destroyed) return dead();
@@ -131,27 +107,6 @@ async function handle(msg: any) {
               }
             : { behavior: "deny", message: answer.message || "Denied from OpenMausBot" },
         );
-    return send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text }] } });
-  }
-  if (String(msg.method ?? "").startsWith("notifications/")) return;
-  if (msg.id != null) {
-    send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `method not found: ${msg.method}` } });
-  }
-}
-
-let inBuf = "";
-process.stdin.on("data", (chunk) => {
-  inBuf += chunk;
-  let nl;
-  while ((nl = inBuf.indexOf("\n")) !== -1) {
-    const line = inBuf.slice(0, nl);
-    inBuf = inBuf.slice(nl + 1);
-    if (!line.trim()) continue;
-    try {
-      void handle(JSON.parse(line));
-    } catch {
-      /* ignore malformed lines */
-    }
-  }
+    send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }] } });
+  },
 });
-process.stdin.on("end", () => process.exit(0));

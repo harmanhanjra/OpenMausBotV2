@@ -15,11 +15,10 @@ import type {
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
-  RuntimeEvent,
-  RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
-import { newEventId, newId } from "../contracts.ts";
+import { newId } from "../contracts.ts";
+import { createEventHub } from "./events.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "boxAgent";
@@ -55,19 +54,9 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
   async create(input: DriverCreateInput<BoxAgentConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
     const token = input.environment.BOX_TOKEN ?? process.env.BOX_TOKEN ?? "";
-    const listeners = new Set<RuntimeEventListener>();
+    const hub = createEventHub(DRIVER_KIND);
+    const { emit, base } = hub;
     const active = new Map<string, { cancel: () => void; turnId: string; boxId: string }>();
-
-    const emit = (event: RuntimeEvent) => {
-      for (const l of [...listeners]) l(event);
-    };
-    const base = (threadId: string, turnId: string) => ({
-      eventId: newEventId(),
-      provider: DRIVER_KIND,
-      threadId,
-      turnId,
-      createdAt: new Date().toISOString(),
-    });
 
     const api = async (path: string, opts: RequestInit = {}) => {
       const res = await fetch(`${BOX_API}${path}`, {
@@ -232,14 +221,11 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
         stopAll: async () => {
           for (const { cancel } of active.values()) cancel();
         },
-        onEvent: (listener) => {
-          listeners.add(listener);
-          return () => listeners.delete(listener);
-        },
+        onEvent: hub.onEvent,
       },
       dispose: async () => {
         for (const { cancel } of active.values()) cancel();
-        listeners.clear();
+        hub.clear();
       },
     };
   },

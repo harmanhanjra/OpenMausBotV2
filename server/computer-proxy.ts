@@ -26,6 +26,8 @@
 //     type, Enter) in one round trip with one frame at the end.
 //
 // stdout is the MCP channel — never console.log here.
+import { send, serveMcpStdio, textResult as text } from "./mcp-stdio.ts";
+
 const BOX_API = process.env.OGB_BOX_API ?? "https://ascii.dev/api/box/v1";
 const boxId = process.env.OGB_BOX_ID ?? "";
 const token = process.env.OGB_BOX_TOKEN ?? "";
@@ -223,12 +225,6 @@ async function frameFrom(out: RunOut): Promise<Frame | null> {
   if (!fetched) return null;
   return { data: fetched, mime: "image/jpeg", hash, geometry };
 }
-
-const send = (obj: unknown): void => {
-  process.stdout.write(JSON.stringify(obj) + "\n");
-};
-const text = (id: unknown, t: string, isError = false): void =>
-  send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: t }], ...(isError ? { isError: true } : {}) } });
 
 /** An action result: the text plus the frame the action produced. When
  * the pixels are byte-identical to the frame the model just saw, the
@@ -546,45 +542,10 @@ async function call(id: unknown, name: string, args: any) {
   return text(id, `unknown tool ${name}`, true);
 }
 
-async function handle(msg: any) {
-  if (msg.method === "initialize") {
-    return send({
-      jsonrpc: "2.0",
-      id: msg.id,
-      result: {
-        protocolVersion: msg.params?.protocolVersion ?? "2024-11-05",
-        capabilities: { tools: {} },
-        serverInfo: { name: "openmausbot-computer", version: "3" },
-      },
-    });
-  }
-  if (msg.method === "tools/list") return send({ jsonrpc: "2.0", id: msg.id, result: { tools: TOOLS } });
-  if (msg.method === "tools/call") {
-    try {
-      return await call(msg.id, msg.params?.name, msg.params?.arguments ?? {});
-    } catch (e) {
-      return text(msg.id, `computer tool failed: ${(e as Error).message}`, true);
-    }
-  }
-  if (String(msg.method ?? "").startsWith("notifications/")) return;
-  if (msg.id != null) {
-    send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `method not found: ${msg.method}` } });
-  }
-}
-
-let buf = "";
-process.stdin.on("data", (chunk) => {
-  buf += chunk;
-  let nl;
-  while ((nl = buf.indexOf("\n")) !== -1) {
-    const line = buf.slice(0, nl);
-    buf = buf.slice(nl + 1);
-    if (!line.trim()) continue;
-    try {
-      void handle(JSON.parse(line));
-    } catch {
-      /* ignore malformed lines */
-    }
-  }
+serveMcpStdio({
+  name: "openmausbot-computer",
+  version: "3",
+  tools: TOOLS,
+  call: (id, name, args) => call(id, String(name), args),
+  callError: (e) => `computer tool failed: ${e.message}`,
 });
-process.stdin.on("end", () => process.exit(0));

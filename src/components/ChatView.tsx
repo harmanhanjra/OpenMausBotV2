@@ -1,4 +1,4 @@
-import { Component, memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowDown,
@@ -15,7 +15,16 @@ import {
   Square,
   X,
 } from "lucide-react";
-import { useStore, useStreaming, formatTime, messageVersions, visibleMessages, type Bot, type Message } from "@/state/store";
+import {
+  useStore,
+  useStreaming,
+  dayLabel,
+  formatTime,
+  messageVersions,
+  visibleMessages,
+  type Bot,
+  type Message,
+} from "@/state/store";
 import { MausAvatar } from "./Avatar";
 import { stateForBot } from "@/lib/mascot";
 import { ChatMarkdown } from "./ChatMarkdown";
@@ -23,23 +32,13 @@ import { OptionCard } from "./OptionCard";
 import { Composer } from "./Composer";
 import { ModelPicker } from "./ModelPicker";
 import { ReactionBar, ReactionChips } from "./Reactions";
+import { MessageBoundary, StreamingBubble } from "./StreamingBubble";
 import { cn } from "@/lib/cn";
 
 /** Long user messages collapse behind a fade so pasted walls of text don't
  * bury the conversation; bots get full markdown. */
 const USER_COLLAPSE_CHARS = 600;
 const USER_COLLAPSE_LINES = 8;
-
-/** "Today" / "Yesterday" / "Mon, Aug 11" — real dates, not a hardcoded label. */
-function dayLabel(at: number): string {
-  const d = new Date(at);
-  const now = new Date();
-  const startOfDay = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
-  const diffDays = Math.round((startOfDay(now) - startOfDay(d)) / 86_400_000);
-  if (diffDays === 0) return "Today";
-  if (diffDays === 1) return "Yesterday";
-  return d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
-}
 
 function DaySeparator({ at }: { at: number }) {
   return (
@@ -132,25 +131,6 @@ function ErrorRow({ message, onRetry }: { message: string; onRetry?: () => void 
       </div>
     </div>
   );
-}
-
-/** One bad markdown node must not white-screen the app — the transcript
- * degrades to a plain-text bubble instead. */
-class MessageBoundary extends Component<{ children: ReactNode; fallbackText: string }, { failed: boolean }> {
-  state = { failed: false };
-  static getDerivedStateFromError() {
-    return { failed: true };
-  }
-  render() {
-    if (this.state.failed) {
-      return (
-        <div className="max-w-[70%] rounded-2xl bg-card px-4 py-2.5 text-[15px] leading-relaxed whitespace-pre-wrap text-ink">
-          {this.props.fallbackText}
-        </div>
-      );
-    }
-    return this.props.children;
-  }
 }
 
 /** Inline editor a user bubble turns into: Enter sends (forking the
@@ -404,22 +384,6 @@ function ScreenFrame({ png, mime }: { png: string; mime?: string }) {
         alt="Bot's screen"
         className="max-w-[70%] rounded-2xl border border-hairline/40"
       />
-    </div>
-  );
-}
-
-function StreamingBubble({ text }: { text: string }) {
-  // markdown re-parses on a deferred value: when tokens arrive faster than
-  // the parser keeps up, React lags the parse instead of janking the frame
-  const deferred = useDeferredValue(text);
-  return (
-    <div className="flex w-full justify-start">
-      <div className="max-w-[70%] rounded-2xl bg-card px-4 py-2.5 text-[15px] leading-relaxed text-ink">
-        <MessageBoundary fallbackText={deferred}>
-          <ChatMarkdown text={deferred} streaming />
-        </MessageBoundary>
-        <span className="animate-caret ml-0.5 inline-block h-[14px] w-[2px] bg-ink align-middle" />
-      </div>
     </div>
   );
 }

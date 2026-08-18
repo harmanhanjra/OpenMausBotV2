@@ -24,11 +24,10 @@ import type {
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
-  RuntimeEvent,
-  RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
-import { newEventId, newId } from "../contracts.ts";
+import { newId } from "../contracts.ts";
+import { createEventHub } from "./events.ts";
 import { appendNative } from "./native.ts";
 import { DEFAULT_KEY_ENV, DEFAULT_URL, discoverModels } from "./nvidia.ts";
 
@@ -158,7 +157,8 @@ export const PrimeAgentDriver: ProviderDriver<PrimeAgentConfig> = {
   async create(input: DriverCreateInput<PrimeAgentConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
     const apiKey = input.environment[config.apiKeyEnv] ?? process.env[config.apiKeyEnv] ?? "";
-    const listeners = new Set<RuntimeEventListener>();
+    const hub = createEventHub(DRIVER_KIND, { providerInstanceId: instanceId });
+    const { emit, base } = hub;
 
     // Mutable catalog surfaced to the model picker. Seeded with the curated
     // fallback, then refreshed from the endpoint's /v1/models so prime-agent
@@ -236,18 +236,6 @@ export const PrimeAgentDriver: ProviderDriver<PrimeAgentConfig> = {
         console.error("[primeAgent] Discovery FAILED for", instanceId, e?.message ?? String(e));
       });
     }
-
-    const emit = (event: RuntimeEvent) => {
-      for (const l of [...listeners]) l(event);
-    };
-    const base = (threadId: string, turnId: string) => ({
-      eventId: newEventId(),
-      provider: DRIVER_KIND,
-      providerInstanceId: instanceId,
-      threadId,
-      turnId,
-      createdAt: new Date().toISOString(),
-    });
 
     const resolveModel = (modelId: string) => {
       modelRegistry.refresh();
@@ -587,10 +575,7 @@ export const PrimeAgentDriver: ProviderDriver<PrimeAgentConfig> = {
         stopAll: async () => {
           for (const threadId of [...active.keys()]) abortThread(threadId);
         },
-        onEvent: (listener) => {
-          listeners.add(listener);
-          return () => listeners.delete(listener);
-        },
+        onEvent: hub.onEvent,
       },
       generateText: async (prompt: string) => {
         const small =
@@ -627,7 +612,7 @@ export const PrimeAgentDriver: ProviderDriver<PrimeAgentConfig> = {
         }
         sessions.clear();
         sessionForThread.clear();
-        listeners.clear();
+        hub.clear();
       },
     };
   },

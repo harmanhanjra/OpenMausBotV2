@@ -3,25 +3,16 @@
 // idle/working motion IS the status), the bulletin is one pinned line, and
 // bot messages carry a small maus + name cluster label. Bots reply only
 // when @mentioned (the composer's @ picker knows the members).
-import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, Pin } from "lucide-react";
-import { useStore, useStreaming, formatTime, type Bot, type Group } from "@/state/store";
+import { useStore, useStreaming, dayLabel, formatTime, type Bot, type Group } from "@/state/store";
 import { MausAvatar } from "./Avatar";
 import { normalizeState } from "@/lib/mascot";
 import { ChatMarkdown } from "./ChatMarkdown";
 import { Composer } from "./Composer";
 import { ReactionBar, ReactionChips } from "./Reactions";
+import { StreamingBubble } from "./StreamingBubble";
 import { cn } from "@/lib/cn";
-
-function dayLabel(at: number): string {
-  const d = new Date(at);
-  const now = new Date();
-  const startOfDay = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
-  const diffDays = Math.round((startOfDay(now) - startOfDay(d)) / 86_400_000);
-  if (diffDays === 0) return "Today";
-  if (diffDays === 1) return "Yesterday";
-  return d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
-}
 
 /** 16px maus + name, shown once per sender cluster. */
 function ClusterLabel({ bot, name, color }: { bot?: Bot; name: string; color: string }) {
@@ -106,18 +97,6 @@ const Transcript = memo(function Transcript({
     </>
   );
 });
-
-function StreamingBubble({ text }: { text: string }) {
-  const deferred = useDeferredValue(text);
-  return (
-    <div className="flex w-full justify-start">
-      <div className="max-w-[70%] rounded-2xl bg-card px-4 py-2.5 text-[15px] leading-relaxed text-ink">
-        <ChatMarkdown text={deferred} streaming />
-        <span className="animate-caret ml-0.5 inline-block h-[14px] w-[2px] bg-ink align-middle" />
-      </div>
-    </div>
-  );
-}
 
 export function GroupView({ group }: { group: Group }) {
   const { state, dispatch } = useStore();

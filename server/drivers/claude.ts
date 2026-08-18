@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import { DATA_DIR } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
+import { onJsonLines, onLines } from "../lines.ts";
 import { brokerSocketPath, execCli, killCliTree, spawnCli } from "../procs.ts";
 
 import type {
@@ -23,11 +24,11 @@ import type {
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
-  RuntimeEvent,
-  RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
-import { newEventId, newId } from "../contracts.ts";
+import { newId } from "../contracts.ts";
+import { probeCliVersion, trackStderr } from "./cli.ts";
+import { createEventHub } from "./events.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "claudeAgent";
@@ -107,42 +108,29 @@ function createPermissionBroker(opts: {
   } catch {}
   const server = createNetServer((conn) => {
     conn.on("error", () => {});
-    let buf = "";
-    conn.on("data", (chunk) => {
-      buf += chunk;
-      let nl;
-      while ((nl = buf.indexOf("\n")) !== -1) {
-        const line = buf.slice(0, nl);
-        buf = buf.slice(nl + 1);
-        let msg: any;
+    onJsonLines(conn, (msg) => {
+      if (msg.t !== "ask") return;
+      const askId = String(msg.id ?? newId());
+      const kind = msg.kind === "question" ? ("question" as const) : ("permission" as const);
+      const ask: Ask = { id: askId, kind, tool: msg.tool ?? "tool", input: msg.input ?? {}, at: Date.now() };
+      const finish = (behavior: string, message: string | undefined, source: string) => {
+        if (!pending.delete(askId)) return;
+        clearTimeout(timer);
         try {
-          msg = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (msg.t !== "ask") continue;
-        const askId = String(msg.id ?? newId());
-        const kind = msg.kind === "question" ? ("question" as const) : ("permission" as const);
-        const ask: Ask = { id: askId, kind, tool: msg.tool ?? "tool", input: msg.input ?? {}, at: Date.now() };
-        const finish = (behavior: string, message: string | undefined, source: string) => {
-          if (!pending.delete(askId)) return;
-          clearTimeout(timer);
-          try {
-            conn.write(JSON.stringify({ t: "answer", id: askId, behavior, message }) + "\n");
-          } catch {}
-          opts.onResolve({ ...ask, behavior, source });
-        };
-        const timer = setTimeout(
-          () =>
-            kind === "question"
-              ? finish("answer", QUESTION_TIMEOUT_NOTE, "timeout")
-              : finish("deny", DENY_TIMEOUT_NOTE, "timeout"),
-          timeoutMs,
-        );
-        timer.unref?.();
-        pending.set(askId, { ask, finish });
-        opts.onAsk(ask);
-      }
+          conn.write(JSON.stringify({ t: "answer", id: askId, behavior, message }) + "\n");
+        } catch {}
+        opts.onResolve({ ...ask, behavior, source });
+      };
+      const timer = setTimeout(
+        () =>
+          kind === "question"
+            ? finish("answer", QUESTION_TIMEOUT_NOTE, "timeout")
+            : finish("deny", DENY_TIMEOUT_NOTE, "timeout"),
+        timeoutMs,
+      );
+      timer.unref?.();
+      pending.set(askId, { ask, finish });
+      opts.onAsk(ask);
     });
   });
   server.on("error", () => {});
@@ -203,20 +191,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
 
   async create(input: DriverCreateInput<ClaudeConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
-    const listeners = new Set<RuntimeEventListener>();
+    const hub = createEventHub(DRIVER_KIND);
+    const { emit, base } = hub;
     // one active turn per thread; a second send while busy is a caller bug
     const active = new Map<string, { stop: () => void; turnId: string; broker?: ReturnType<typeof createPermissionBroker> }>();
-
-    const emit = (event: RuntimeEvent) => {
-      for (const l of [...listeners]) l(event);
-    };
-    const base = (threadId: string, turnId: string) => ({
-      eventId: newEventId(),
-      provider: DRIVER_KIND,
-      threadId,
-      turnId,
-      createdAt: new Date().toISOString(),
-    });
 
     const sendTurn = async (turn: SendTurnInput) => {
       const { threadId } = turn;
@@ -411,22 +389,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         }
       };
 
-      let buf = "";
-      child.stdout.on("data", (chunk) => {
-        buf += chunk;
-        let nl;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
-          if (line.trim()) handleLine(line);
-        }
-      });
-
-      let stderr = "";
-      child.stderr.on("data", (c) => {
-        stderr += c;
-        if (stderr.length > 8192) stderr = stderr.slice(-8192);
-      });
+      onLines(child.stdout, handleLine);
+      const stderrTail = trackStderr(child);
 
       child.on("error", (e) => {
         emit({ ...base(threadId, turnId), type: "runtime.error", message: `spawn failed: ${e.message}` });
@@ -438,7 +402,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           emit({
             ...base(threadId, turnId),
             type: "runtime.error",
-            message: `claude exited ${code} before result${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`,
+            message: `claude exited ${code} before result${stderrTail() ? `: ${stderrTail().trim().slice(-300)}` : ""}`,
           });
           settle(false, "exit_before_result");
         }
@@ -458,11 +422,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env: { ...process.env, PATH: augmentedPath() } }, (err, stdout) =>
-          resolve(err ? null : stdout.trim()),
-        );
-      });
+      const version = await probeCliVersion(config.cli);
       if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
       const authenticated = existsSync(join(homedir(), ".claude", ".credentials.json"));
       return { state: "available", version, authenticated };
@@ -492,10 +452,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         stopAll: async () => {
           for (const { stop } of active.values()) stop();
         },
-        onEvent: (listener) => {
-          listeners.add(listener);
-          return () => listeners.delete(listener);
-        },
+        onEvent: hub.onEvent,
       },
       generateText: (prompt: string) =>
         new Promise((resolve, reject) => {
@@ -508,7 +465,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         }),
       dispose: async () => {
         for (const { stop } of active.values()) stop();
-        listeners.clear();
+        hub.clear();
       },
     };
   },

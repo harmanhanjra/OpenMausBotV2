@@ -8,12 +8,15 @@ import type {
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
-  RuntimeEvent,
-  RuntimeEventListener,
   SendTurnInput,
 } from "../contracts.ts";
-import { newEventId, newId } from "../contracts.ts";
-import { appendNative } from "./native.ts";
+import { createEventHub } from "./events.ts";
+import {
+  abortControls,
+  createChatCompleter,
+  createChatTurnSender,
+  type ActiveChatTurn,
+} from "./openaiCompat.ts";
 
 const DRIVER_KIND = "grok";
 const DEFAULT_URL = "https://api.x.ai/v1";
@@ -52,134 +55,27 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
   async create(input: DriverCreateInput<GrokConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
     const apiKey = input.environment[config.apiKeyEnv] ?? process.env[config.apiKeyEnv] ?? "";
-    const listeners = new Set<RuntimeEventListener>();
-    const active = new Map<string, { abort: AbortController; turnId: string }>();
+    const hub = createEventHub(DRIVER_KIND);
+    const active = new Map<string, ActiveChatTurn>();
+    const controls = abortControls(active);
 
-    const emit = (event: RuntimeEvent) => {
-      for (const l of [...listeners]) l(event);
-    };
-    const base = (threadId: string, turnId: string) => ({
-      eventId: newEventId(),
-      provider: DRIVER_KIND,
-      threadId,
-      turnId,
-      createdAt: new Date().toISOString(),
+    const complete = createChatCompleter({
+      url: config.url,
+      apiKey,
+      errorFor: (status, body) => new Error(`xAI HTTP ${status}${body ? `: ${body.slice(0, 200)}` : ""}`),
     });
 
-    const complete = async (
-      messages: Array<{ role: string; content: string }>,
-      model: string,
-      opts: { stream: boolean; signal?: AbortSignal; onDelta?: (d: string) => void },
-    ): Promise<{ text: string; usage: { input: number; output: number } | null }> => {
-      const res = await fetch(`${config.url}/chat/completions`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ model, messages, stream: opts.stream }),
-        signal: opts.signal ?? AbortSignal.timeout(120_000),
-      });
-      if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        throw new Error(`xAI HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ""}`);
-      }
-      if (!opts.stream) {
-        const json: any = await res.json();
-        return {
-          text: json.choices?.[0]?.message?.content ?? "",
-          usage: json.usage
-            ? { input: json.usage.prompt_tokens ?? 0, output: json.usage.completion_tokens ?? 0 }
-            : null,
-        };
-      }
-      let text = "";
-      let usage: { input: number; output: number } | null = null;
-      const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") continue;
-          let chunk: any;
-          try {
-            chunk = JSON.parse(data);
-          } catch {
-            continue;
-          }
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) {
-            text += delta;
-            opts.onDelta?.(delta);
-          }
-          if (chunk.usage) {
-            usage = { input: chunk.usage.prompt_tokens ?? 0, output: chunk.usage.completion_tokens ?? 0 };
-          }
-        }
-      }
-      return { text, usage };
-    };
+    const runTurn = createChatTurnSender({
+      hub,
+      active,
+      nativeSource: "xai.chat.completions",
+      defaultModel: () => MODELS.default,
+      complete,
+    });
 
     const sendTurn = async (turn: SendTurnInput) => {
-      const { threadId } = turn;
       if (!apiKey) throw new Error(`no xAI key — set ${config.apiKeyEnv} or config.json xai.key`);
-      if (active.has(threadId)) throw new Error("a turn is already running on this thread");
-      const turnId = newId();
-      const abort = new AbortController();
-      active.set(threadId, { abort, turnId });
-
-      const messages = [
-        ...(turn.system ? [{ role: "system", content: turn.system }] : []),
-        ...(turn.transcript ?? []).map((m) => ({
-          role: m.role === "assistant" ? "assistant" : "user",
-          content: m.text,
-        })),
-        { role: "user", content: turn.text },
-      ];
-      appendNative(threadId, { dir: "out", source: "xai.chat.completions", msg: { model: turn.model, messages } });
-
-      emit({ ...base(threadId, turnId), type: "turn.started" });
-      emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model: turn.model ?? MODELS.default });
-
-      (async () => {
-        try {
-          const { text, usage } = await complete(messages, turn.model || MODELS.default, {
-            stream: true,
-            signal: abort.signal,
-            onDelta: (delta) =>
-              emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta }),
-          });
-          appendNative(threadId, { dir: "in", source: "xai.chat.completions", msg: { text, usage } });
-          if (text.trim()) {
-            emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text });
-          }
-          if (usage) {
-            emit({ ...base(threadId, turnId), type: "thread.token-usage.updated", ...usage });
-          }
-          active.delete(threadId);
-          emit({ ...base(threadId, turnId), type: "turn.completed", ok: true, stopReason: null, cost: null });
-        } catch (e) {
-          active.delete(threadId);
-          const aborted = (e as Error).name === "AbortError";
-          if (!aborted) {
-            emit({ ...base(threadId, turnId), type: "runtime.error", message: (e as Error).message });
-          }
-          emit({
-            ...base(threadId, turnId),
-            type: "turn.completed",
-            ok: false,
-            stopReason: aborted ? "interrupted" : "error",
-            cost: null,
-          });
-        }
-      })();
-
-      return { turnId };
+      return runTurn(turn);
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
@@ -203,26 +99,21 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
         provider: DRIVER_KIND,
         capabilities: { sessionModelSwitch: "in-session" },
         sendTurn,
-        interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
+        interruptTurn: controls.interruptTurn,
         respondToRequest: async () => {
           throw new Error("grok driver has no pending asks");
         },
-        hasSession: (threadId) => active.has(threadId),
-        stopAll: async () => {
-          for (const { abort } of active.values()) abort.abort();
-        },
-        onEvent: (listener) => {
-          listeners.add(listener);
-          return () => listeners.delete(listener);
-        },
+        hasSession: controls.hasSession,
+        stopAll: controls.stopAll,
+        onEvent: hub.onEvent,
       },
       generateText: async (prompt: string) => {
         const { text } = await complete([{ role: "user", content: prompt }], "grok-3-mini", { stream: false });
         return text;
       },
       dispose: async () => {
-        for (const { abort } of active.values()) abort.abort();
-        listeners.clear();
+        controls.abortAll();
+        hub.clear();
       },
     };
   },
