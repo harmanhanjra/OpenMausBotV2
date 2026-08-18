@@ -66,7 +66,7 @@ beforeAll(async () => {
   await new Promise<void>((r) => stub.listen(0, "127.0.0.1", r));
   stubPort = (stub.address() as { port: number }).port;
 
-  child = spawn(process.execPath, [PROXY], {
+  child = spawn(process.env.OMB_NODE_BINARY || process.execPath, [PROXY], {
     env: {
       ...process.env,
       OMB_HARNESS_URL: `http://127.0.0.1:${stubPort}`,

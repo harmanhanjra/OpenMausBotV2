@@ -9,6 +9,8 @@ import type { InstanceConfigMap } from "./contracts.ts";
 
 export interface AppConfig {
   xai?: { key?: string; url?: string };
+  /** DeepSeek Harness (dsh) — key = sk-… (platform.deepseek.com). */
+  deepseek?: { key?: string };
   /** NVIDIA NIM — key = nvapi-… (build.nvidia.com). Self-hosted NIM/vLLM
    * needs no key: set `instances.<id>.config.url` to the local endpoint. */
   nvidia?: { key?: string; url?: string };
@@ -51,6 +53,7 @@ export function loadConfig(): AppConfig {
   }
   cfg.xai = { key: process.env.XAI_API_KEY, ...cfg.xai };
   cfg.nvidia = { key: process.env.NVIDIA_API_KEY, ...cfg.nvidia };
+  cfg.deepseek = { key: process.env.DEEPSEEK_API_KEY, ...cfg.deepseek };
   cfg.composio = { key: process.env.COMPOSIO_KEY, ...cfg.composio };
   cfg.box = { token: process.env.BOX_TOKEN, ...cfg.box };
   return cfg;
@@ -66,7 +69,7 @@ export function saveConfig(patch: Partial<AppConfig>): void {
   } catch {
     /* first write */
   }
-  for (const key of ["xai", "nvidia", "composio", "box", "profile"] as const) {
+  for (const key of ["xai", "nvidia", "deepseek", "composio", "box", "profile"] as const) {
     if (patch[key] && typeof patch[key] === "object") {
       disk[key] = { ...(disk[key] as object), ...patch[key] };
     }
@@ -103,12 +106,14 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
           antigravity: { driver: "antigravityAgent" },
           nvidia: { driver: "nvidia" },
           prime: { driver: "primeAgent" },
+          deepseek: { driver: "deepseek" },
           computer: { driver: "boxAgent" },
         };
   for (const entry of Object.values(map)) {
     entry.environment = {
       ...(cfg.xai?.key ? { XAI_API_KEY: cfg.xai.key } : {}),
       ...(cfg.nvidia?.key ? { NVIDIA_API_KEY: cfg.nvidia.key } : {}),
+      ...(cfg.deepseek?.key ? { DEEPSEEK_API_KEY: cfg.deepseek.key } : {}),
       ...(cfg.box?.token ? { BOX_TOKEN: cfg.box.token } : {}),
       ...entry.environment,
     };

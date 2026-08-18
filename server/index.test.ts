@@ -37,7 +37,7 @@ beforeAll(async () => {
     JSON.stringify({ instances: { ghost: { driver: "not-a-real-driver", displayName: "Ghost" } } }),
   );
 
-  child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], {
+  child = spawn(process.env.OMB_NODE_BINARY || process.execPath, [join(SERVER_DIR, "index.ts")], {
     cwd: ROOT,
     env: {
       ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
@@ -210,5 +210,22 @@ describe("harness HTTP API", () => {
     const res = await api("GET", "/api/definitely-not-a-route");
     expect(res.status).toBe(404);
     expect(res.body.error).toContain("/api/definitely-not-a-route");
+  });
+
+  it("rejects cross-origin state changes and oversized JSON bodies", async () => {
+    const blocked = await fetch(`${BASE}/api/config`, {
+      method: "PUT",
+      headers: { origin: "https://attacker.example", "content-type": "application/json" },
+      body: JSON.stringify({ profile: { name: "blocked" } }),
+    });
+    expect(blocked.status).toBe(403);
+
+    const oversizedBody = JSON.stringify({ profile: { name: "x".repeat(1_000_000) } });
+    const oversized = await fetch(`${BASE}/api/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: oversizedBody,
+    });
+    expect(oversized.status).toBe(413);
   });
 });
