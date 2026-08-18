@@ -1,7 +1,7 @@
 // Config + data dirs. One file, ~/.openmausbot/config.json, env fallbacks:
 //   { "xai": {"key":"xai-…"}, "composio": {"key":"ck_…"}, "box": {"token":"…"},
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -39,7 +39,9 @@ export function ensureDirs() {
       /* cross-device or busy — fall through to a fresh dir */
     }
   }
-  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true });
+  // 0700: the data dir holds provider API keys and every transcript, so it
+  // is owner-only rather than the default world-readable 0755
+  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
 
 export function loadConfig(): AppConfig {
@@ -71,8 +73,14 @@ export function saveConfig(patch: Partial<AppConfig>): void {
       disk[key] = { ...(disk[key] as object), ...patch[key] };
     }
   }
-  mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(p, JSON.stringify(disk, null, 2));
+  mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+  // this file is the app's key store — never leave it group/world readable
+  writeFileSync(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
+  try {
+    chmodSync(p, 0o600); // the mode above only applies when creating the file
+  } catch {
+    /* best effort — Windows and some mounts don't support POSIX modes */
+  }
 }
 
 // Default fleet: one instance per built-in driver (upstream

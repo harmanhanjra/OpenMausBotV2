@@ -107,6 +107,16 @@ const ERROR_PAGE =
     `<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#070707;color:#fcfcfc;font:15px -apple-system,system-ui"><div style="text-align:center;max-width:360px"><div style="font-size:40px">🐭</div><h2 style="font-weight:600;margin:12px 0 6px">Couldn't start the bot server</h2><p style="color:#fcfcfc99;line-height:1.5">Something else is using its ports. Quit and reopen OpenMausBot — if it keeps happening, restart your computer.</p></div></body>`,
   );
 
+/** http(s) only — the single scheme set safe to hand to the OS browser. */
+function isWebUrl(url) {
+  try {
+    const { protocol } = new URL(url);
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function createWindow() {
   const isMac = process.platform === "darwin";
   const win = new BrowserWindow({
@@ -135,9 +145,27 @@ function createWindow() {
     },
   });
 
+  // Links leave the app through the OS browser, never a new Electron window
+  // — and only as web links: openExternal hands anything else (file:,
+  // ms-msdt:, custom app schemes) straight to the OS, so a link in model
+  // output must not be able to pick the scheme.
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    if (isWebUrl(url)) void shell.openExternal(url);
     return { action: "deny" };
+  });
+
+  // the renderer stays on its own origin: an in-page navigation elsewhere
+  // becomes an external open (or nothing), never a load inside the app
+  win.webContents.on("will-navigate", (event, url) => {
+    if (url === win.webContents.getURL()) return;
+    const appOrigin = app.isPackaged ? `http://127.0.0.1:${SERVER_PORT}` : DEV_URL;
+    try {
+      if (new URL(url).origin === new URL(appOrigin).origin) return;
+    } catch {
+      /* unparseable — treat as external */
+    }
+    event.preventDefault();
+    if (isWebUrl(url)) void shell.openExternal(url);
   });
 
   if (app.isPackaged) {

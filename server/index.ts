@@ -1,11 +1,11 @@
 // OpenMausBot server — the harness host. Clients hold no transports
 // (upstream rule): the React app dispatches typed commands over HTTP and
 // folds one SSE event stream; every provider process runs here.
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
-import { dirname, extname, join } from "node:path";
+import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import * as box from "./box.ts";
@@ -686,22 +686,120 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
+const MAX_BODY_BYTES = 1_000_000;
+
 function readBody(req: IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
     let data = "";
+    let aborted = false;
     req.on("data", (c) => {
+      if (aborted) return;
       data += c;
-      if (data.length > 1_000_000) reject(new Error("body too large"));
+      // drop what we have and discard the rest, rather than only rejecting:
+      // the buffer used to keep growing in memory after the rejection.
+      // The socket stays up so the caller can still read the 413.
+      if (data.length > MAX_BODY_BYTES) {
+        aborted = true;
+        data = "";
+        req.resume();
+        reject(Object.assign(new Error("body too large"), { status: 413 }));
+      }
     });
     req.on("end", () => {
+      if (aborted) return;
       try {
         resolve(data ? JSON.parse(data) : {});
       } catch {
-        reject(new Error("invalid JSON body"));
+        reject(Object.assign(new Error("invalid JSON body"), { status: 400 }));
       }
     });
     req.on("error", reject);
   });
+}
+
+// ── local-origin guard ─────────────────────────────────────────────────
+// The harness binds 127.0.0.1 and has no user credentials of its own, so
+// "only this machine can reach it" is the whole authorization model — and
+// a browser is part of this machine. Without these checks any web page the
+// user has open could drive the API (a cross-site POST with a simple
+// content-type needs no preflight, and this server parses JSON regardless
+// of content-type), and a hostname that resolves to 127.0.0.1 (DNS
+// rebinding) could read transcripts and provider state back.
+//
+//   Host   — must be loopback, so a rebound attacker hostname is refused.
+//   Origin — when present, must be a loopback page: same-machine only.
+function isLoopbackHostname(value: string): boolean {
+  const host = value.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+  return host === "localhost" || host === "::1" || /^127(\.\d{1,3}){3}$/.test(host);
+}
+
+function hostIsLoopback(req: IncomingMessage): boolean {
+  const header = req.headers.host;
+  if (!header) return false;
+  // strip the port; IPv6 authorities arrive bracketed ([::1]:8799)
+  const hostname = header.startsWith("[") ? header.slice(0, header.indexOf("]") + 1) : header.split(":")[0];
+  return isLoopbackHostname(hostname);
+}
+
+function isCrossSite(req: IncomingMessage): boolean {
+  if (req.headers["sec-fetch-site"] === "cross-site") return true;
+  const origin = req.headers.origin;
+  if (!origin) return false;
+  // "null" is an opaque origin (sandboxed iframe, file:// page)
+  if (origin === "null") return true;
+  try {
+    return !isLoopbackHostname(new URL(origin).hostname);
+  } catch {
+    return true;
+  }
+}
+
+// ── request field validation ───────────────────────────────────────────
+// Writable fields are typed and length-capped here rather than copied
+// through: patches are persisted to bots.json and several of them (name,
+// title, description, room bulletin) are interpolated into provider system
+// prompts, so an object where a string belongs used to be stored — and
+// prompted — verbatim.
+const FIELD_LIMITS = {
+  name: 80,
+  title: 120,
+  description: 2000,
+  color: 40,
+  mascotExpression: 40,
+  bulletin: 4000,
+} as const;
+
+function stringField(value: unknown, max: number): string | undefined {
+  return typeof value === "string" ? value.slice(0, max) : undefined;
+}
+
+function booleanField(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function enumField<T extends string>(value: unknown, allowed: readonly T[]): T | undefined {
+  return typeof value === "string" && (allowed as readonly string[]).includes(value) ? (value as T) : undefined;
+}
+
+function modelSelectionField(value: unknown): { instanceId: string; model: string } | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const { instanceId, model } = value as Record<string, unknown>;
+  if (typeof instanceId !== "string" || typeof model !== "string") return undefined;
+  return { instanceId: instanceId.slice(0, 120), model: model.slice(0, 200) };
+}
+
+/** Drop rejected fields so a bad value leaves the stored one alone
+ * instead of overwriting it with undefined. */
+function definedOnly(patch: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
+}
+
+/** Constant-time bearer-token check for the internal comms endpoints. */
+function bearerMatches(header: string | undefined, expected: string): boolean {
+  const provided = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 const server = createServer(async (req, res) => {
@@ -709,11 +807,15 @@ const server = createServer(async (req, res) => {
   const path = url.pathname;
   const method = req.method ?? "GET";
   try {
+    if (!hostIsLoopback(req) || isCrossSite(req)) {
+      return json(res, 403, { error: "forbidden: this API is local-only" });
+    }
+
     // ── internal peer-agent comms (localhost + shared token only) ──────
     // The agents-proxy (spawned inside a bot's agent process) calls these to
     // discover peers and hand a message to one. Not part of the public API.
     if (path.startsWith("/api/internal/")) {
-      if (req.headers.authorization !== `Bearer ${COMMS_TOKEN}`) {
+      if (!bearerMatches(req.headers.authorization, COMMS_TOKEN)) {
         return json(res, 401, { error: "unauthorized" });
       }
       if (method === "GET" && path === "/api/internal/agents") {
@@ -856,10 +958,11 @@ const server = createServer(async (req, res) => {
     m = path.match(/^\/api\/groups\/([\w-]+)$/);
     if (m && method === "PATCH") {
       const body = await readBody(req);
-      const patch: Record<string, unknown> = {};
-      for (const key of ["name", "bulletin", "unread"] as const) {
-        if (body[key] !== undefined) patch[key] = body[key];
-      }
+      const patch: Record<string, unknown> = definedOnly({
+        name: stringField(body.name, FIELD_LIMITS.name),
+        bulletin: stringField(body.bulletin, FIELD_LIMITS.bulletin),
+        unread: booleanField(body.unread),
+      });
       if (Array.isArray(body.memberIds)) {
         const ids = body.memberIds.filter((id: unknown): id is string => typeof id === "string" && Boolean(store.bot(id)));
         if (ids.length) patch.memberIds = ids;
@@ -925,10 +1028,19 @@ const server = createServer(async (req, res) => {
     m = path.match(/^\/api\/bots\/([\w-]+)$/);
     if (m && method === "PATCH") {
       const body = await readBody(req);
-      const patch: Record<string, unknown> = {};
-      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotExpression", "pinned", "hidden"] as const) {
-        if (body[key] !== undefined) patch[key] = body[key];
-      }
+      const patch: Record<string, unknown> = definedOnly({
+        name: stringField(body.name, FIELD_LIMITS.name),
+        title: stringField(body.title, FIELD_LIMITS.title),
+        description: stringField(body.description, FIELD_LIMITS.description),
+        color: stringField(body.color, FIELD_LIMITS.color),
+        mascotExpression: stringField(body.mascotExpression, FIELD_LIMITS.mascotExpression),
+        computer: enumField(body.computer, ["cloud", "local", "off"] as const),
+        modelSelection: modelSelectionField(body.modelSelection),
+        notifications: booleanField(body.notifications),
+        unread: booleanField(body.unread),
+        pinned: booleanField(body.pinned),
+        hidden: booleanField(body.hidden),
+      });
       const bot = store.patchBot(m[1], patch);
       if (!bot) return json(res, 404, { error: "no such bot" });
       broadcast({ kind: "bot", bot });
@@ -1124,9 +1236,20 @@ const server = createServer(async (req, res) => {
     // packaged app: the server serves the built UI too (window → :8799 for
     // everything, no dev proxy to die). OMB_STATIC_DIR is set by Electron.
     if (method === "GET" && !path.startsWith("/api/") && STATIC_DIR) {
-      const safe = path === "/" ? "/index.html" : path.replace(/\.\./g, "");
-      const file = join(STATIC_DIR, safe);
+      // Resolve first, then require the result to stay under the root: the
+      // old ".."-stripping rewrite is a blocklist, and percent-encoded or
+      // overlapping traversals walk straight past it into the filesystem.
+      const root = resolve(STATIC_DIR);
+      let requested = path;
       try {
+        requested = decodeURIComponent(path);
+      } catch {
+        /* malformed escapes — fall back to the raw path */
+      }
+      const file = resolve(root, "." + (requested === "/" ? "/index.html" : requested));
+      const insideRoot = file === root || file.startsWith(root + sep);
+      try {
+        if (!insideRoot) throw new Error("outside the static root");
         const data = readFileSync(file);
         res.writeHead(200, { "content-type": MIME[extname(file)] ?? "application/octet-stream" });
         return res.end(data);
