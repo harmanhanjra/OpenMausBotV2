@@ -77,7 +77,7 @@ posixOnly("comms e2e (fake ACP fleet)", () => {
       }),
     );
 
-    child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], {
+    child = spawn(process.env.OMB_NODE_BINARY || process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
       env: {
         ...(process.env.PATH ? { PATH: process.env.PATH } : {}),

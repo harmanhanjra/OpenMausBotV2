@@ -76,7 +76,7 @@ describe("computer proxy (fake box)", () => {
     await new Promise<void>((r) => box.listen(0, "127.0.0.1", r));
     port = (box.address() as any).port;
 
-    proxy = spawn(process.execPath, ["--experimental-strip-types", PROXY], {
+    proxy = spawn(process.env.OMB_NODE_BINARY || process.execPath, ["--experimental-strip-types", PROXY], {
       env: {
         ...process.env,
         OGB_BOX_API: `http://127.0.0.1:${port}`,

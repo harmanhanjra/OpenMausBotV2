@@ -12,10 +12,14 @@ import * as box from "./box.ts";
 import * as composio from "./composio.ts";
 import { ensureDirs, instanceConfigs, loadConfig, saveConfig, EVENTS_DIR, NATIVE_DIR } from "./config.ts";
 import type { RuntimeEvent } from "./contracts.ts";
+import { memoryRAG } from "./memory-rag.ts";
+import { conversationEngine } from "./conversation-engine.ts";
+import { toolsRegistry } from "./tools-registry.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
+import { scheduler } from "./scheduler.ts";
 import { mentionedBots, Store, type Message } from "./store.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
@@ -42,11 +46,15 @@ bus.attach(registry.instances());
 // ── peer-agent comms wiring ────────────────────────────────────────────
 // A shared secret guards the localhost-only /api/internal endpoints the
 // agents-proxy calls; regenerated each boot (the proxy gets it via env).
-const COMMS_TOKEN = randomBytes(24).toString("hex");
+// Set OMB_COMMS_TOKEN to a fixed value for live testing; otherwise random.
+const COMMS_TOKEN = process.env.OMB_COMMS_TOKEN || randomBytes(24).toString("hex");
 // Cap message chains: depth 0 = a user-initiated turn (may ask a peer);
 // a peer invoked via ask_bot runs at depth 1 and gets NO agents tool, so
 // A→B is allowed but B→C (and A→B→A loops) never start.
 const MAX_COMMS_DEPTH = 1;
+// The CEO monitor treats a bot as "not responding" when it has been busy
+// this long without completing — long enough to rule out a normal turn.
+const STUCK_AFTER_MS = 5 * 60_000;
 // proxy entry: .ts in dev (node type-strips), .js in the packaged dist-server
 const agentsProxyPath = (() => {
   const ts = join(dirname(fileURLToPath(import.meta.url)), "drivers", "agents-proxy.ts");
@@ -63,6 +71,7 @@ function agentsIntegration(botId: string, depth: number) {
       ...AGENTS_NODE_FLAG,
       OMB_HARNESS_URL: `http://127.0.0.1:${PORT}`,
       OMB_BOT_ID: botId,
+      OMB_BOT_ROLE: store.bot(botId)?.role ?? "",
       OMB_COMMS_TOKEN: COMMS_TOKEN,
       OMB_TURN_DEPTH: String(depth),
     },
@@ -118,6 +127,30 @@ let bootSelection = { instanceId: "claude", model: "claude-sonnet-5" };
 const store = new Store(() => bootSelection);
 bootSelection = await defaultSelection();
 store.seedIfEmpty();
+
+// ── scheduler boot ─────────────────────────────────────────────────────
+// Load persisted schedules, wire the dispatch (a scheduled fire runs the
+// same turn path as a typed message), and start the tick loop. startTurn is
+// hoisted, so the arrow here is fine.
+scheduler.dispatch = async (botId, text) => {
+  await startTurn(botId, `[scheduled] ${text}`);
+};
+scheduler.load();
+scheduler.start();
+
+// CEO watch: if a bot is designated role "ceo", seed a 10-minute monitor
+// schedule for it (if none exists) so it keeps watch over the team. The
+// prompt names its governance tools so the agent knows what to do.
+const ceoBot = store.bots.find((b) => b.role === "ceo" && !b.hidden);
+if (ceoBot && !scheduler.list().some((s) => s.botId === ceoBot.id)) {
+  scheduler.upsert({
+    botId: ceoBot.id,
+    cron: "*/10 * * * *",
+    prompt:
+      "CEO watch: use monitor_agents to survey the whole team. For any agent that is STUCK or busy far past normal, change its model with set_bot_model (to a healthy model on a good instance), then interrupt_bot to stop its hung turn. Report the health of the team and anything you fixed.",
+    enabled: true,
+  });
+}
 
 // ── SSE fan-out to clients ─────────────────────────────────────────────
 const sseClients = new Set<ServerResponse>();
@@ -231,7 +264,7 @@ bus.subscribe((event: RuntimeEvent) => {
         // the screenshot-in-chat moment
         const frame = stopScreenPoller(bot.id);
         if (frame) pushMessage({ role: "bot", kind: "screen", png: frame.png, mime: frame.mime });
-        store.patchBot(bot.id, { busy: false, unread: true });
+        store.patchBot(bot.id, { busy: false, unread: true, busySince: undefined, lastActivityAt: Date.now() });
         broadcast({ kind: "bot", bot: store.bot(bot.id) });
       }
       // group busy/unread settle in the group turn engine, which knows
@@ -399,7 +432,7 @@ async function startTurn(
   // busy flips immediately so the composer locks; the dispatch itself runs
   // in the background — box provisioning can take ~90s and must never
   // hang the HTTP request
-  store.patchBot(bot.id, { busy: true, unread: false });
+  store.patchBot(bot.id, { busy: true, unread: false, busySince: Date.now() });
   broadcast({ kind: "bot", bot: store.bot(bot.id) });
 
   void (async () => {
@@ -431,7 +464,12 @@ async function startTurn(
         }
         if (b) {
           previewBoxId = b.id;
-          if (mountsComputer) integrations.computer = { boxId: b.id, token: cfg.box!.token! };
+          if (mountsComputer) {
+            integrations.computer = { boxId: b.id, token: cfg.box!.token! };
+            // the global tools registry's computer_*/browser_* tools act on
+            // the box bound here (the bot that last ran a turn)
+            toolsRegistry.bindComputer(b.id, cfg.box!.token ?? null);
+          }
         }
       }
       // local computer (this Mac) via the Electron-hosted cua-driver: the
@@ -480,7 +518,9 @@ async function startTurn(
               ? " You can act on the user's computer through the computer tools — take a screenshot or read the desktop state first, prefer accessibility actions over raw coordinates, and act carefully."
               : "") +
           (integrations.agents
-            ? " You can work with the user's other bots through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply."
+            ? bot.role === "ceo"
+              ? " You are the CEO bot. You can work with the user's other bots through the agents tools — monitor_agents shows the whole team's health (model, busy state, stuck flags), set_bot_model switches a non-responsive agent to another model, interrupt_bot stops a hung turn, and ask_bot messages a peer. Watch the team regularly and keep everyone responsive."
+              : " You can work with the user's other bots through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply."
             : "") +
           (tagged.length
             ? ` The user tagged ${tagged
@@ -557,7 +597,9 @@ async function runGroupMemberTurn(
   }
 
   store.patchGroup(group.id, { busyBotId: bot.id });
+  store.patchBot(bot.id, { busy: true, busySince: Date.now() });
   broadcastGroup(group.id);
+  broadcast({ kind: "bot", bot: store.bot(bot.id) });
   groupSpeakers.set(group.threadId, { botId: bot.id, name: bot.name, color: bot.color });
 
   const roster = group.memberIds
@@ -611,7 +653,9 @@ async function runGroupMemberTurn(
   });
   groupSpeakers.delete(group.threadId);
   store.patchGroup(group.id, { busyBotId: null, unread: true });
+  store.patchBot(bot.id, { busy: false, busySince: undefined, lastActivityAt: Date.now() });
   broadcastGroup(group.id);
+  broadcast({ kind: "bot", bot: store.bot(bot.id) });
 
   // chained mentions: a member's reply can summon teammates — one hop only
   if (hop < MAX_GROUP_HOPS && replyText.trim()) {
@@ -663,6 +707,7 @@ function configStatus() {
   return {
     xai: { configured: Boolean(cfg.xai?.key) },
     nvidia: { configured: Boolean(cfg.nvidia?.key) },
+    deepseek: { configured: Boolean(cfg.deepseek?.key) },
     composio: { configured: Boolean(cfg.composio?.key), apiKeyConfigured: Boolean(cfg.composio?.apiKey) },
     box: { configured: Boolean(cfg.box?.token) },
     // not a secret — the sidebar shows it
@@ -682,32 +727,73 @@ async function reloadProviders() {
 // ── HTTP plumbing ─────────────────────────────────────────────────────
 function json(res: ServerResponse, status: number, body: unknown) {
   const data = JSON.stringify(body);
-  res.writeHead(status, { "content-type": "application/json" });
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+  });
   res.end(data);
 }
 
 function readBody(req: IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
+    const maxBytes = 1_000_000;
+    const bodyError = (message: string, status: number) => Object.assign(new Error(message), { status });
+    const declaredLength = Number(req.headers["content-length"] ?? 0);
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      reject(bodyError("body too large", 413));
+      req.resume();
+      return;
+    }
     let data = "";
+    let settled = false;
     req.on("data", (c) => {
+      if (settled) return;
       data += c;
-      if (data.length > 1_000_000) reject(new Error("body too large"));
+      if (Buffer.byteLength(data, "utf8") > maxBytes) {
+        settled = true;
+        req.resume();
+        reject(bodyError("body too large", 413));
+      }
     });
     req.on("end", () => {
+      if (settled) return;
+      settled = true;
       try {
         resolve(data ? JSON.parse(data) : {});
       } catch {
-        reject(new Error("invalid JSON body"));
+        reject(bodyError("invalid JSON body", 400));
       }
     });
-    req.on("error", reject);
+    req.on("error", (error) => {
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    });
   });
+}
+
+function requestOriginAllowed(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true; // CLI/native clients do not send Origin.
+  try {
+    const parsed = new URL(origin);
+    const allowedPorts = new Set([String(PORT), "5199"]);
+    return ["127.0.0.1", "localhost"].includes(parsed.hostname) && allowedPorts.has(parsed.port);
+  } catch {
+    return false;
+  }
 }
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   const path = url.pathname;
   const method = req.method ?? "GET";
+
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && !requestOriginAllowed(req)) {
+    return json(res, 403, { error: "origin not allowed" });
+  }
   try {
     // ── internal peer-agent comms (localhost + shared token only) ──────
     // The agents-proxy (spawned inside a bot's agent process) calls these to
@@ -729,8 +815,49 @@ const server = createServer(async (req, res) => {
             busy: !!b.busy,
             title: b.title || undefined,
             description: b.description || undefined,
+            role: b.role || undefined,
+            busySince: b.busySince ?? null,
+            lastActivityAt: b.lastActivityAt ?? null,
+            stuck: !!b.busy && b.busySince != null && Date.now() - b.busySince > STUCK_AFTER_MS,
           }));
         return json(res, 200, { bots });
+      }
+      // CEO governance: the designated "ceo" bot may switch another bot's
+      // model (when it stopped responding) and interrupt a hung turn. Only
+      // the ceo role gets this — same shared COMMS_TOKEN gate as ask-bot.
+      if (method === "POST" && path === "/api/internal/set-bot-model") {
+        const body = await readBody(req);
+        const fromBotId = String(body.fromBotId ?? "");
+        const toBotId = String(body.toBotId ?? "");
+        const instanceId = String(body.instanceId ?? "");
+        const model = String(body.model ?? "");
+        const caller = store.bot(fromBotId);
+        if (!caller || caller.role !== "ceo") return json(res, 403, { error: "only the ceo bot may change another bot's model" });
+        const target = store.bot(toBotId);
+        if (!target) return json(res, 404, { error: "no such bot" });
+        const instance = registry.get(instanceId);
+        if (!instance) return json(res, 404, { error: `provider instance "${instanceId}" is unavailable` });
+        const known = instance.models.options.some((o) => o.id === model) || instance.models.default === model;
+        if (!known) return json(res, 400, { error: `model "${model}" not found on instance "${instanceId}"` });
+        store.patchBot(toBotId, { modelSelection: { instanceId, model } });
+        broadcast({ kind: "bot", bot: store.bot(toBotId) });
+        return json(res, 200, { ok: true, modelSelection: { instanceId, model } });
+      }
+      if (method === "POST" && path === "/api/internal/interrupt-bot") {
+        const body = await readBody(req);
+        const fromBotId = String(body.fromBotId ?? "");
+        const toBotId = String(body.toBotId ?? "");
+        const caller = store.bot(fromBotId);
+        if (!caller || caller.role !== "ceo") return json(res, 403, { error: "only the ceo bot may interrupt another bot" });
+        const target = store.bot(toBotId);
+        if (!target) return json(res, 404, { error: "no such bot" });
+        await registry
+          .get(target.modelSelection.instanceId)
+          ?.adapter.interruptTurn(target.threadId)
+          .catch(() => {});
+        store.patchBot(toBotId, { busy: false, busySince: undefined });
+        broadcast({ kind: "bot", bot: store.bot(toBotId) });
+        return json(res, 200, { ok: true });
       }
       if (method === "POST" && path === "/api/internal/ask-bot") {
         const body = await readBody(req);
@@ -926,7 +1053,7 @@ const server = createServer(async (req, res) => {
     if (m && method === "PATCH") {
       const body = await readBody(req);
       const patch: Record<string, unknown> = {};
-      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotExpression", "pinned", "hidden"] as const) {
+      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotExpression", "pinned", "hidden", "role"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       const bot = store.patchBot(m[1], patch);
@@ -1067,7 +1194,7 @@ const server = createServer(async (req, res) => {
     if ((method === "PUT" || method === "PATCH") && path === "/api/config") {
       const body = await readBody(req);
       const patch: Record<string, object> = {};
-      for (const key of ["xai", "nvidia", "composio", "box", "profile"] as const) {
+      for (const key of ["xai", "nvidia", "deepseek", "composio", "box", "profile"] as const) {
         if (body[key] && typeof body[key] === "object") patch[key] = body[key];
       }
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
@@ -1119,6 +1246,233 @@ const server = createServer(async (req, res) => {
         case "screenshot":
           return json(res, 200, await box.screenshotBox(cfg, botId));
       }
+    }
+
+    // ── the scheduler: recurring "wake this bot with a prompt" jobs ──
+    m = path.match(/^\/api\/schedules$/);
+    if (m) {
+      if (method === "GET") return json(res, 200, scheduler.list());
+      if (method === "POST") {
+        const body = await readBody(req);
+        const botId = String(body.botId ?? "");
+        if (!store.bot(botId)) return json(res, 404, { error: "no such bot" });
+        const s = scheduler.upsert({
+          id: body.id ? String(body.id) : undefined,
+          botId,
+          cron: String(body.cron ?? ""),
+          prompt: String(body.prompt ?? ""),
+          enabled: body.enabled !== false,
+        });
+        if (!s) return json(res, 400, { error: `invalid cron expression: ${String(body.cron ?? "")}` });
+        return json(res, 200, s);
+      }
+      return json(res, 405, { error: "method not allowed" });
+    }
+    m = path.match(/^\/api\/schedules\/([\w-]+)$/);
+    if (m) {
+      const id = m[1];
+      if (method === "DELETE") {
+        return json(res, 200, { removed: scheduler.remove(id) });
+      }
+      if (method === "PATCH") {
+        const body = await readBody(req);
+        const existing = scheduler.get(id);
+        if (!existing) return json(res, 404, { error: "no such schedule" });
+        const s = scheduler.upsert({
+          id,
+          botId: existing.botId,
+          cron: body.cron !== undefined ? String(body.cron) : existing.cron,
+          prompt: body.prompt !== undefined ? String(body.prompt) : existing.prompt,
+          enabled: body.enabled !== undefined ? !!body.enabled : existing.enabled,
+        });
+        if (!s) return json(res, 400, { error: `invalid cron expression: ${String(body.cron ?? existing.cron)}` });
+        return json(res, 200, s);
+      }
+      return json(res, 405, { error: "method not allowed" });
+    }
+
+    // ── memory RAG: semantic search & knowledge base ────────────────────────
+    if (method === "POST" && path === "/api/memory/rag/search") {
+      const body = await readBody(req);
+      const threadId = String(body.threadId ?? "");
+      const query = String(body.query ?? "").trim();
+      const topK = Number(body.topK ?? 5);
+      if (!threadId || !query) return json(res, 400, { error: "threadId and query required" });
+      const results = await memoryRAG.hybridSearch(threadId, query, { topK });
+      return json(res, 200, { results });
+    }
+    if (method === "POST" && path === "/api/memory/rag/ingest") {
+      const body = await readBody(req);
+      const threadId = String(body.threadId ?? "");
+      const content = String(body.content ?? "").trim();
+      const metadata = (body.metadata as Record<string, unknown>) ?? {};
+      if (!threadId || !content) return json(res, 400, { error: "threadId and content required" });
+      const ids = await memoryRAG.addDocuments(threadId, [{ content, metadata }]);
+      return json(res, 200, { ids });
+    }
+    if (method === "POST" && path === "/api/memory/rag/ingest-file") {
+      const body = await readBody(req);
+      const threadId = String(body.threadId ?? "");
+      const filePath = String(body.path ?? "").trim();
+      const metadata = (body.metadata as Record<string, unknown>) ?? {};
+      if (!threadId || !filePath) return json(res, 400, { error: "threadId and path required" });
+      try {
+        const fs = await import("node:fs/promises");
+        const content = await fs.readFile(filePath, "utf8");
+        const ids = await memoryRAG.ingestFile(threadId, filePath, content, metadata);
+        return json(res, 200, { ids });
+      } catch (e) {
+        return json(res, 500, { error: `Failed to ingest file: ${e instanceof Error ? e.message : String(e)}` });
+      }
+    }
+    if (method === "GET" && path === "/api/memory/rag/stats") {
+      const threadId = url.searchParams.get("threadId");
+      if (!threadId) return json(res, 400, { error: "threadId required" });
+      const stats = memoryRAG.getStats(threadId);
+      return json(res, 200, stats);
+    }
+    if (method === "DELETE" && path === "/api/memory/rag/clear") {
+      const body = await readBody(req);
+      const threadId = String(body.threadId ?? "");
+      if (!threadId) return json(res, 400, { error: "threadId required" });
+      await memoryRAG.clearThread(threadId);
+      return json(res, 200, { ok: true });
+    }
+
+    // ── conversation engine: templates, routing, health ─────────────────────
+    if (method === "GET" && path === "/api/conversation/templates") {
+      return json(res, 200, { templates: conversationEngine.listTemplates() });
+    }
+    if (method === "GET" && path === "/api/conversation/health") {
+      return json(res, 200, conversationEngine.getHealth());
+    }
+    if (method === "POST" && path === "/api/conversation/route") {
+      const body = await readBody(req);
+      const text = String(body.text ?? "");
+      const defaultSelection = body.defaultSelection as { instanceId: string; model: string } | undefined;
+      if (!text || !defaultSelection) return json(res, 400, { error: "text and defaultSelection required" });
+      const routed = conversationEngine.routeModel(text, defaultSelection);
+      return json(res, 200, { modelSelection: routed });
+    }
+
+    // ── tools registry: tools, skills, workflows, MCP ───────────────────────
+    if (method === "GET" && path === "/api/tools") {
+      return json(res, 200, { tools: toolsRegistry.listTools().map((t) => ({ name: t.name, label: t.label, description: t.description, tags: t.tags })) });
+    }
+    if (method === "POST" && path === "/api/tools/execute") {
+      const body = await readBody(req);
+      const name = String(body.name ?? "");
+      const params = (body.params as Record<string, unknown>) ?? {};
+      const role = body.role as string | undefined;
+      if (!name) return json(res, 400, { error: "tool name required" });
+      const result = await toolsRegistry.executeTool(name, params, { role });
+      return json(res, 200, result);
+    }
+    if (method === "GET" && path === "/api/tools/skills") {
+      return json(res, 200, { skills: toolsRegistry.listSkills() });
+    }
+    if (method === "POST" && path === "/api/tools/skills/suggest") {
+      const body = await readBody(req);
+      const query = String(body.query ?? "");
+      const skills = toolsRegistry.suggestSkills(query);
+      return json(res, 200, { skills });
+    }
+    if (method === "GET" && path === "/api/tools/workflows") {
+      return json(res, 200, { workflows: toolsRegistry.listWorkflows() });
+    }
+    if (method === "POST" && path === "/api/tools/workflows/execute") {
+      const body = await readBody(req);
+      const workflowId = String(body.workflowId ?? "");
+      const params = (body.params as Record<string, unknown>) ?? {};
+      if (!workflowId) return json(res, 400, { error: "workflowId required" });
+      try {
+        const result = await toolsRegistry.executeWorkflow(workflowId, params);
+        return json(res, 200, { result });
+      } catch (e) {
+        return json(res, 500, { error: `Workflow execution failed: ${e instanceof Error ? e.message : String(e)}` });
+      }
+    }
+    if (method === "GET" && path === "/api/tools/mcp") {
+      return json(res, 200, { servers: toolsRegistry.listMCPServers().map((s) => ({ name: s.config.name, connected: s.connected, tools: s.tools.length, resources: s.resources.length })) });
+    }
+    if (method === "POST" && path === "/api/tools/mcp/add") {
+      const body = await readBody(req);
+      const config = body.config as { name: string; command: string; args: string[]; env?: Record<string, string>; transport?: "stdio" | "sse" | "websocket"; url?: string };
+      if (!config?.name || !config?.command || !config?.args) return json(res, 400, { error: "name, command, args required" });
+      try {
+        await toolsRegistry.addMCPServer(config);
+        return json(res, 200, { ok: true });
+      } catch (e) {
+        return json(res, 500, { error: `Failed to add MCP server: ${e instanceof Error ? e.message : String(e)}` });
+      }
+    }
+    if (method === "POST" && path === "/api/tools/mcp/remove") {
+      const body = await readBody(req);
+      const name = String(body.name ?? "");
+      if (!name) return json(res, 400, { error: "name required" });
+      const ok = await toolsRegistry.removeMCPServer(name);
+      return json(res, 200, { ok });
+    }
+    if (method === "GET" && path === "/api/tools/mcp/presets") {
+      return json(res, 200, { presets: toolsRegistry.listMCPPresets() });
+    }
+    if (method === "POST" && path === "/api/tools/mcp/preset") {
+      const body = await readBody(req);
+      const name = String(body.name ?? "");
+      if (!name) return json(res, 400, { error: "name required" });
+      try {
+        const server = await toolsRegistry.ensurePresetMCP(name);
+        if (!server) return json(res, 404, { error: `Preset unavailable: ${name} (is the runtime installed?)` });
+        return json(res, 200, { ok: true, name: server.config.name, tools: server.tools.length });
+      } catch (e) {
+        return json(res, 500, { error: `Failed to add MCP preset: ${e instanceof Error ? e.message : String(e)}` });
+      }
+    }
+
+    // ── user profiles ───────────────────────────────────────────────────────
+    if (method === "GET" && path === "/api/profile") {
+      const userId = url.searchParams.get("userId") ?? "default";
+      const profile = memoryRAG.getProfile(userId);
+      return json(res, 200, { profile });
+    }
+    if (method === "PUT" && path === "/api/profile") {
+      const body = await readBody(req);
+      const userId = String(body.userId ?? "default");
+      const profile = memoryRAG.upsertProfile({ id: userId, ...body });
+      return json(res, 200, { profile });
+    }
+
+    // ── knowledge graph ─────────────────────────────────────────────────────
+    if (method === "GET" && path === "/api/knowledge-graph") {
+      const threadId = url.searchParams.get("threadId");
+      if (!threadId) return json(res, 400, { error: "threadId required" });
+      const nodes = memoryRAG.getGraphNodes(threadId);
+      const edges = memoryRAG.getGraphEdges(threadId);
+      return json(res, 200, { nodes, edges });
+    }
+    if (method === "POST" && path === "/api/knowledge-graph/node") {
+      const body = await readBody(req);
+      const threadId = String(body.threadId ?? "");
+      const node = body.node;
+      if (!threadId || !node) return json(res, 400, { error: "threadId and node required" });
+      const created = memoryRAG.addGraphNode(threadId, node);
+      return json(res, 200, { node: created });
+    }
+    if (method === "POST" && path === "/api/knowledge-graph/edge") {
+      const body = await readBody(req);
+      const threadId = String(body.threadId ?? "");
+      const edge = body.edge;
+      if (!threadId || !edge) return json(res, 400, { error: "threadId and edge required" });
+      const created = memoryRAG.addGraphEdge(threadId, edge);
+      return json(res, 200, { edge: created });
+    }
+    if (method === "POST" && path === "/api/knowledge-graph/extract") {
+      const body = await readBody(req);
+      const threadId = String(body.threadId ?? "");
+      const text = String(body.text ?? "");
+      if (!threadId || !text) return json(res, 400, { error: "threadId and text required" });
+      await memoryRAG.buildKnowledgeGraphFromText(threadId, text);
+      return json(res, 200, { ok: true });
     }
 
     // packaged app: the server serves the built UI too (window → :8799 for
