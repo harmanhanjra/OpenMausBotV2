@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DATA_DIR, ensureDirs, instanceConfigs, loadConfig, saveConfig } from "./config.ts";
 
 const CONFIG_PATH = join(DATA_DIR, "config.json");
-const ENV_KEYS = ["XAI_API_KEY", "NVIDIA_API_KEY", "COMPOSIO_KEY", "BOX_TOKEN"] as const;
+const ENV_KEYS = ["XAI_API_KEY", "NVIDIA_API_KEY", "DEEPSEEK_API_KEY", "COMPOSIO_KEY", "BOX_TOKEN"] as const;
 const savedEnv: Record<string, string | undefined> = {};
 
 beforeEach(() => {
@@ -110,7 +110,7 @@ describe("instanceConfigs", () => {
   it("builds the default fleet when no instances are configured", () => {
     const map = instanceConfigs({});
     expect(Object.keys(map).sort()).toEqual(
-      ["antigravity", "claude", "codex", "computer", "grok", "nvidia", "prime"].sort(),
+      ["antigravity", "claude", "codex", "computer", "deepseek", "grok", "nvidia", "prime"].sort(),
     );
     // the default grok instance rides the CLI driver, not the API-key one
     expect(map.grok.driver).toBe("grokAgent");
