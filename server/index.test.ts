@@ -5,6 +5,7 @@
 // the shadow-instance behavior end to end while it's at it.
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +29,25 @@ const api = async (method: string, path: string, body?: unknown): Promise<{ stat
   return { status: res.status, body: await res.json() };
 };
 
+// node:http, not fetch: the guard tests need to send headers fetch refuses
+// to forward (Host, Origin, Sec-Fetch-Site).
+const rawGet = (path: string, headers: Record<string, string>): Promise<{ status: number; body: any }> =>
+  new Promise((resolve, reject) => {
+    const req = httpRequest({ host: "127.0.0.1", port: PORT, path, method: "GET", headers }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try {
+          resolve({ status: res.statusCode ?? 0, body: data ? JSON.parse(data) : null });
+        } catch {
+          resolve({ status: res.statusCode ?? 0, body: data });
+        }
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+
 beforeAll(async () => {
   home = mkdtempSync(join(tmpdir(), "omb-api-test-"));
   // a fleet of exactly one unknown driver: no CLI probes, no network
@@ -37,7 +57,7 @@ beforeAll(async () => {
     JSON.stringify({ instances: { ghost: { driver: "not-a-real-driver", displayName: "Ghost" } } }),
   );
 
-  child = spawn(process.env.OMB_NODE_BINARY || process.execPath, [join(SERVER_DIR, "index.ts")], {
+  child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], {
     cwd: ROOT,
     env: {
       ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
@@ -211,21 +231,72 @@ describe("harness HTTP API", () => {
     expect(res.status).toBe(404);
     expect(res.body.error).toContain("/api/definitely-not-a-route");
   });
+});
 
-  it("rejects cross-origin state changes and oversized JSON bodies", async () => {
-    const blocked = await fetch(`${BASE}/api/config`, {
-      method: "PUT",
-      headers: { origin: "https://attacker.example", "content-type": "application/json" },
-      body: JSON.stringify({ profile: { name: "blocked" } }),
+// The whole authorization model is "only this machine, and only our own
+// page" — a browser on this machine is otherwise free to drive the API.
+describe("local-origin guard", () => {
+  it("refuses a request whose Host is not loopback (DNS rebinding)", async () => {
+    const res = await rawGet("/api/bots", { host: "attacker.example.com" });
+    expect(res.status).toBe(403);
+  });
+
+  it("refuses a cross-site page's request", async () => {
+    const evil = await rawGet("/api/bots", { origin: "https://evil.example.com" });
+    expect(evil.status).toBe(403);
+
+    const sandboxed = await rawGet("/api/bots", { origin: "null" });
+    expect(sandboxed.status).toBe(403);
+
+    const marked = await rawGet("/api/bots", { "sec-fetch-site": "cross-site" });
+    expect(marked.status).toBe(403);
+  });
+
+  it("allows the app's own loopback page", async () => {
+    const res = await rawGet("/api/health", { origin: `http://localhost:${PORT}`, "sec-fetch-site": "same-origin" });
+    expect(res.status).toBe(200);
+  });
+
+  it("requires the comms token on internal endpoints", async () => {
+    expect((await api("GET", "/api/internal/agents")).status).toBe(401);
+    const wrong = await rawGet("/api/internal/agents", { authorization: "Bearer not-the-token" });
+    expect(wrong.status).toBe(401);
+  });
+});
+
+describe("request validation", () => {
+  it("ignores patch fields of the wrong type instead of storing them", async () => {
+    const { body } = await api("GET", "/api/bots");
+    const bot = body.bots[0];
+
+    const res = await api("PATCH", `/api/bots/${bot.id}`, {
+      name: { evil: "object" },
+      pinned: "yes",
+      computer: "bring-your-own",
+      description: "kept",
     });
-    expect(blocked.status).toBe(403);
+    expect(res.status).toBe(200);
+    expect(res.body.bot.name).toBe(bot.name);
+    expect(res.body.bot.pinned).toBe(bot.pinned);
+    expect(res.body.bot.computer).toBe(bot.computer);
+    expect(res.body.bot.description).toBe("kept");
+  });
 
-    const oversizedBody = JSON.stringify({ profile: { name: "x".repeat(1_000_000) } });
-    const oversized = await fetch(`${BASE}/api/config`, {
-      method: "PUT",
+  it("caps long strings and rejects oversized or malformed bodies", async () => {
+    const { body } = await api("GET", "/api/bots");
+    const bot = body.bots[0];
+
+    const long = await api("PATCH", `/api/bots/${bot.id}`, { name: "n".repeat(500) });
+    expect(long.body.bot.name).toHaveLength(80);
+
+    const huge = await api("PATCH", `/api/bots/${bot.id}`, { description: "d".repeat(2_000_000) });
+    expect(huge.status).toBe(413);
+
+    const malformed = await fetch(`${BASE}/api/bots/${bot.id}`, {
+      method: "PATCH",
       headers: { "content-type": "application/json" },
-      body: oversizedBody,
+      body: "{not json",
     });
-    expect(oversized.status).toBe(413);
+    expect(malformed.status).toBe(400);
   });
 });

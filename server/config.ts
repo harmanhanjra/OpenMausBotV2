@@ -1,7 +1,7 @@
 // Config + data dirs. One file, ~/.openmausbot/config.json, env fallbacks:
 //   { "xai": {"key":"xai-…"}, "composio": {"key":"ck_…"}, "box": {"token":"…"},
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -9,8 +9,6 @@ import type { InstanceConfigMap } from "./contracts.ts";
 
 export interface AppConfig {
   xai?: { key?: string; url?: string };
-  /** DeepSeek Harness (dsh) — key = sk-… (platform.deepseek.com). */
-  deepseek?: { key?: string };
   /** NVIDIA NIM — key = nvapi-… (build.nvidia.com). Self-hosted NIM/vLLM
    * needs no key: set `instances.<id>.config.url` to the local endpoint. */
   nvidia?: { key?: string; url?: string };
@@ -41,7 +39,9 @@ export function ensureDirs() {
       /* cross-device or busy — fall through to a fresh dir */
     }
   }
-  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true });
+  // 0700: the data dir holds provider API keys and every transcript, so it
+  // is owner-only rather than the default world-readable 0755
+  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
 
 export function loadConfig(): AppConfig {
@@ -53,7 +53,6 @@ export function loadConfig(): AppConfig {
   }
   cfg.xai = { key: process.env.XAI_API_KEY, ...cfg.xai };
   cfg.nvidia = { key: process.env.NVIDIA_API_KEY, ...cfg.nvidia };
-  cfg.deepseek = { key: process.env.DEEPSEEK_API_KEY, ...cfg.deepseek };
   cfg.composio = { key: process.env.COMPOSIO_KEY, ...cfg.composio };
   cfg.box = { token: process.env.BOX_TOKEN, ...cfg.box };
   return cfg;
@@ -69,13 +68,19 @@ export function saveConfig(patch: Partial<AppConfig>): void {
   } catch {
     /* first write */
   }
-  for (const key of ["xai", "nvidia", "deepseek", "composio", "box", "profile"] as const) {
+  for (const key of ["xai", "nvidia", "composio", "box", "profile"] as const) {
     if (patch[key] && typeof patch[key] === "object") {
       disk[key] = { ...(disk[key] as object), ...patch[key] };
     }
   }
-  mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(p, JSON.stringify(disk, null, 2));
+  mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+  // this file is the app's key store — never leave it group/world readable
+  writeFileSync(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
+  try {
+    chmodSync(p, 0o600); // the mode above only applies when creating the file
+  } catch {
+    /* best effort — Windows and some mounts don't support POSIX modes */
+  }
 }
 
 // Default fleet: one instance per built-in driver (upstream
@@ -106,14 +111,12 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
           antigravity: { driver: "antigravityAgent" },
           nvidia: { driver: "nvidia" },
           prime: { driver: "primeAgent" },
-          deepseek: { driver: "deepseek" },
           computer: { driver: "boxAgent" },
         };
   for (const entry of Object.values(map)) {
     entry.environment = {
       ...(cfg.xai?.key ? { XAI_API_KEY: cfg.xai.key } : {}),
       ...(cfg.nvidia?.key ? { NVIDIA_API_KEY: cfg.nvidia.key } : {}),
-      ...(cfg.deepseek?.key ? { DEEPSEEK_API_KEY: cfg.deepseek.key } : {}),
       ...(cfg.box?.token ? { BOX_TOKEN: cfg.box.token } : {}),
       ...entry.environment,
     };

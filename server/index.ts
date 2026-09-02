@@ -1,25 +1,21 @@
 // OpenMausBot server — the harness host. Clients hold no transports
 // (upstream rule): the React app dispatches typed commands over HTTP and
 // folds one SSE event stream; every provider process runs here.
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
-import { dirname, extname, join } from "node:path";
+import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import * as box from "./box.ts";
 import * as composio from "./composio.ts";
 import { ensureDirs, instanceConfigs, loadConfig, saveConfig, EVENTS_DIR, NATIVE_DIR } from "./config.ts";
 import type { RuntimeEvent } from "./contracts.ts";
-import { memoryRAG } from "./memory-rag.ts";
-import { conversationEngine } from "./conversation-engine.ts";
-import { toolsRegistry } from "./tools-registry.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
-import { scheduler } from "./scheduler.ts";
 import { mentionedBots, Store, type Message } from "./store.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
@@ -46,15 +42,11 @@ bus.attach(registry.instances());
 // ── peer-agent comms wiring ────────────────────────────────────────────
 // A shared secret guards the localhost-only /api/internal endpoints the
 // agents-proxy calls; regenerated each boot (the proxy gets it via env).
-// Set OMB_COMMS_TOKEN to a fixed value for live testing; otherwise random.
-const COMMS_TOKEN = process.env.OMB_COMMS_TOKEN || randomBytes(24).toString("hex");
+const COMMS_TOKEN = randomBytes(24).toString("hex");
 // Cap message chains: depth 0 = a user-initiated turn (may ask a peer);
 // a peer invoked via ask_bot runs at depth 1 and gets NO agents tool, so
 // A→B is allowed but B→C (and A→B→A loops) never start.
 const MAX_COMMS_DEPTH = 1;
-// The CEO monitor treats a bot as "not responding" when it has been busy
-// this long without completing — long enough to rule out a normal turn.
-const STUCK_AFTER_MS = 5 * 60_000;
 // proxy entry: .ts in dev (node type-strips), .js in the packaged dist-server
 const agentsProxyPath = (() => {
   const ts = join(dirname(fileURLToPath(import.meta.url)), "drivers", "agents-proxy.ts");
@@ -71,7 +63,6 @@ function agentsIntegration(botId: string, depth: number) {
       ...AGENTS_NODE_FLAG,
       OMB_HARNESS_URL: `http://127.0.0.1:${PORT}`,
       OMB_BOT_ID: botId,
-      OMB_BOT_ROLE: store.bot(botId)?.role ?? "",
       OMB_COMMS_TOKEN: COMMS_TOKEN,
       OMB_TURN_DEPTH: String(depth),
     },
@@ -127,30 +118,6 @@ let bootSelection = { instanceId: "claude", model: "claude-sonnet-5" };
 const store = new Store(() => bootSelection);
 bootSelection = await defaultSelection();
 store.seedIfEmpty();
-
-// ── scheduler boot ─────────────────────────────────────────────────────
-// Load persisted schedules, wire the dispatch (a scheduled fire runs the
-// same turn path as a typed message), and start the tick loop. startTurn is
-// hoisted, so the arrow here is fine.
-scheduler.dispatch = async (botId, text) => {
-  await startTurn(botId, `[scheduled] ${text}`);
-};
-scheduler.load();
-scheduler.start();
-
-// CEO watch: if a bot is designated role "ceo", seed a 10-minute monitor
-// schedule for it (if none exists) so it keeps watch over the team. The
-// prompt names its governance tools so the agent knows what to do.
-const ceoBot = store.bots.find((b) => b.role === "ceo" && !b.hidden);
-if (ceoBot && !scheduler.list().some((s) => s.botId === ceoBot.id)) {
-  scheduler.upsert({
-    botId: ceoBot.id,
-    cron: "*/10 * * * *",
-    prompt:
-      "CEO watch: use monitor_agents to survey the whole team. For any agent that is STUCK or busy far past normal, change its model with set_bot_model (to a healthy model on a good instance), then interrupt_bot to stop its hung turn. Report the health of the team and anything you fixed.",
-    enabled: true,
-  });
-}
 
 // ── SSE fan-out to clients ─────────────────────────────────────────────
 const sseClients = new Set<ServerResponse>();
@@ -264,7 +231,7 @@ bus.subscribe((event: RuntimeEvent) => {
         // the screenshot-in-chat moment
         const frame = stopScreenPoller(bot.id);
         if (frame) pushMessage({ role: "bot", kind: "screen", png: frame.png, mime: frame.mime });
-        store.patchBot(bot.id, { busy: false, unread: true, busySince: undefined, lastActivityAt: Date.now() });
+        store.patchBot(bot.id, { busy: false, unread: true });
         broadcast({ kind: "bot", bot: store.bot(bot.id) });
       }
       // group busy/unread settle in the group turn engine, which knows
@@ -432,7 +399,7 @@ async function startTurn(
   // busy flips immediately so the composer locks; the dispatch itself runs
   // in the background — box provisioning can take ~90s and must never
   // hang the HTTP request
-  store.patchBot(bot.id, { busy: true, unread: false, busySince: Date.now() });
+  store.patchBot(bot.id, { busy: true, unread: false });
   broadcast({ kind: "bot", bot: store.bot(bot.id) });
 
   void (async () => {
@@ -464,12 +431,7 @@ async function startTurn(
         }
         if (b) {
           previewBoxId = b.id;
-          if (mountsComputer) {
-            integrations.computer = { boxId: b.id, token: cfg.box!.token! };
-            // the global tools registry's computer_*/browser_* tools act on
-            // the box bound here (the bot that last ran a turn)
-            toolsRegistry.bindComputer(b.id, cfg.box!.token ?? null);
-          }
+          if (mountsComputer) integrations.computer = { boxId: b.id, token: cfg.box!.token! };
         }
       }
       // local computer (this Mac) via the Electron-hosted cua-driver: the
@@ -518,9 +480,7 @@ async function startTurn(
               ? " You can act on the user's computer through the computer tools — take a screenshot or read the desktop state first, prefer accessibility actions over raw coordinates, and act carefully."
               : "") +
           (integrations.agents
-            ? bot.role === "ceo"
-              ? " You are the CEO bot. You can work with the user's other bots through the agents tools — monitor_agents shows the whole team's health (model, busy state, stuck flags), set_bot_model switches a non-responsive agent to another model, interrupt_bot stops a hung turn, and ask_bot messages a peer. Watch the team regularly and keep everyone responsive."
-              : " You can work with the user's other bots through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply."
+            ? " You can work with the user's other bots through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply."
             : "") +
           (tagged.length
             ? ` The user tagged ${tagged
@@ -597,9 +557,7 @@ async function runGroupMemberTurn(
   }
 
   store.patchGroup(group.id, { busyBotId: bot.id });
-  store.patchBot(bot.id, { busy: true, busySince: Date.now() });
   broadcastGroup(group.id);
-  broadcast({ kind: "bot", bot: store.bot(bot.id) });
   groupSpeakers.set(group.threadId, { botId: bot.id, name: bot.name, color: bot.color });
 
   const roster = group.memberIds
@@ -653,9 +611,7 @@ async function runGroupMemberTurn(
   });
   groupSpeakers.delete(group.threadId);
   store.patchGroup(group.id, { busyBotId: null, unread: true });
-  store.patchBot(bot.id, { busy: false, busySince: undefined, lastActivityAt: Date.now() });
   broadcastGroup(group.id);
-  broadcast({ kind: "bot", bot: store.bot(bot.id) });
 
   // chained mentions: a member's reply can summon teammates — one hop only
   if (hop < MAX_GROUP_HOPS && replyText.trim()) {
@@ -707,7 +663,6 @@ function configStatus() {
   return {
     xai: { configured: Boolean(cfg.xai?.key) },
     nvidia: { configured: Boolean(cfg.nvidia?.key) },
-    deepseek: { configured: Boolean(cfg.deepseek?.key) },
     composio: { configured: Boolean(cfg.composio?.key), apiKeyConfigured: Boolean(cfg.composio?.apiKey) },
     box: { configured: Boolean(cfg.box?.token) },
     // not a secret — the sidebar shows it
@@ -727,79 +682,140 @@ async function reloadProviders() {
 // ── HTTP plumbing ─────────────────────────────────────────────────────
 function json(res: ServerResponse, status: number, body: unknown) {
   const data = JSON.stringify(body);
-  res.writeHead(status, {
-    "content-type": "application/json; charset=utf-8",
-    "cache-control": "no-store",
-    "x-content-type-options": "nosniff",
-  });
+  res.writeHead(status, { "content-type": "application/json" });
   res.end(data);
 }
 
+const MAX_BODY_BYTES = 1_000_000;
+
 function readBody(req: IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
-    const maxBytes = 1_000_000;
-    const bodyError = (message: string, status: number) => Object.assign(new Error(message), { status });
-    const declaredLength = Number(req.headers["content-length"] ?? 0);
-    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-      reject(bodyError("body too large", 413));
-      req.resume();
-      return;
-    }
     let data = "";
-    let settled = false;
+    let aborted = false;
     req.on("data", (c) => {
-      if (settled) return;
+      if (aborted) return;
       data += c;
-      if (Buffer.byteLength(data, "utf8") > maxBytes) {
-        settled = true;
+      // drop what we have and discard the rest, rather than only rejecting:
+      // the buffer used to keep growing in memory after the rejection.
+      // The socket stays up so the caller can still read the 413.
+      if (data.length > MAX_BODY_BYTES) {
+        aborted = true;
+        data = "";
         req.resume();
-        reject(bodyError("body too large", 413));
+        reject(Object.assign(new Error("body too large"), { status: 413 }));
       }
     });
     req.on("end", () => {
-      if (settled) return;
-      settled = true;
+      if (aborted) return;
       try {
         resolve(data ? JSON.parse(data) : {});
       } catch {
-        reject(bodyError("invalid JSON body", 400));
+        reject(Object.assign(new Error("invalid JSON body"), { status: 400 }));
       }
     });
-    req.on("error", (error) => {
-      if (!settled) {
-        settled = true;
-        reject(error);
-      }
-    });
+    req.on("error", reject);
   });
 }
 
-function requestOriginAllowed(req: IncomingMessage): boolean {
+// ── local-origin guard ─────────────────────────────────────────────────
+// The harness binds 127.0.0.1 and has no user credentials of its own, so
+// "only this machine can reach it" is the whole authorization model — and
+// a browser is part of this machine. Without these checks any web page the
+// user has open could drive the API (a cross-site POST with a simple
+// content-type needs no preflight, and this server parses JSON regardless
+// of content-type), and a hostname that resolves to 127.0.0.1 (DNS
+// rebinding) could read transcripts and provider state back.
+//
+//   Host   — must be loopback, so a rebound attacker hostname is refused.
+//   Origin — when present, must be a loopback page: same-machine only.
+function isLoopbackHostname(value: string): boolean {
+  const host = value.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+  return host === "localhost" || host === "::1" || /^127(\.\d{1,3}){3}$/.test(host);
+}
+
+function hostIsLoopback(req: IncomingMessage): boolean {
+  const header = req.headers.host;
+  if (!header) return false;
+  // strip the port; IPv6 authorities arrive bracketed ([::1]:8799)
+  const hostname = header.startsWith("[") ? header.slice(0, header.indexOf("]") + 1) : header.split(":")[0];
+  return isLoopbackHostname(hostname);
+}
+
+function isCrossSite(req: IncomingMessage): boolean {
+  if (req.headers["sec-fetch-site"] === "cross-site") return true;
   const origin = req.headers.origin;
-  if (!origin) return true; // CLI/native clients do not send Origin.
+  if (!origin) return false;
+  // "null" is an opaque origin (sandboxed iframe, file:// page)
+  if (origin === "null") return true;
   try {
-    const parsed = new URL(origin);
-    const allowedPorts = new Set([String(PORT), "5199"]);
-    return ["127.0.0.1", "localhost"].includes(parsed.hostname) && allowedPorts.has(parsed.port);
+    return !isLoopbackHostname(new URL(origin).hostname);
   } catch {
-    return false;
+    return true;
   }
+}
+
+// ── request field validation ───────────────────────────────────────────
+// Writable fields are typed and length-capped here rather than copied
+// through: patches are persisted to bots.json and several of them (name,
+// title, description, room bulletin) are interpolated into provider system
+// prompts, so an object where a string belongs used to be stored — and
+// prompted — verbatim.
+const FIELD_LIMITS = {
+  name: 80,
+  title: 120,
+  description: 2000,
+  color: 40,
+  mascotExpression: 40,
+  bulletin: 4000,
+} as const;
+
+function stringField(value: unknown, max: number): string | undefined {
+  return typeof value === "string" ? value.slice(0, max) : undefined;
+}
+
+function booleanField(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function enumField<T extends string>(value: unknown, allowed: readonly T[]): T | undefined {
+  return typeof value === "string" && (allowed as readonly string[]).includes(value) ? (value as T) : undefined;
+}
+
+function modelSelectionField(value: unknown): { instanceId: string; model: string } | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const { instanceId, model } = value as Record<string, unknown>;
+  if (typeof instanceId !== "string" || typeof model !== "string") return undefined;
+  return { instanceId: instanceId.slice(0, 120), model: model.slice(0, 200) };
+}
+
+/** Drop rejected fields so a bad value leaves the stored one alone
+ * instead of overwriting it with undefined. */
+function definedOnly(patch: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
+}
+
+/** Constant-time bearer-token check for the internal comms endpoints. */
+function bearerMatches(header: string | undefined, expected: string): boolean {
+  const provided = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   const path = url.pathname;
   const method = req.method ?? "GET";
-
-  if (!["GET", "HEAD", "OPTIONS"].includes(method) && !requestOriginAllowed(req)) {
-    return json(res, 403, { error: "origin not allowed" });
-  }
   try {
+    if (!hostIsLoopback(req) || isCrossSite(req)) {
+      return json(res, 403, { error: "forbidden: this API is local-only" });
+    }
+
     // ── internal peer-agent comms (localhost + shared token only) ──────
     // The agents-proxy (spawned inside a bot's agent process) calls these to
     // discover peers and hand a message to one. Not part of the public API.
     if (path.startsWith("/api/internal/")) {
-      if (req.headers.authorization !== `Bearer ${COMMS_TOKEN}`) {
+      if (!bearerMatches(req.headers.authorization, COMMS_TOKEN)) {
         return json(res, 401, { error: "unauthorized" });
       }
       if (method === "GET" && path === "/api/internal/agents") {
@@ -815,49 +831,8 @@ const server = createServer(async (req, res) => {
             busy: !!b.busy,
             title: b.title || undefined,
             description: b.description || undefined,
-            role: b.role || undefined,
-            busySince: b.busySince ?? null,
-            lastActivityAt: b.lastActivityAt ?? null,
-            stuck: !!b.busy && b.busySince != null && Date.now() - b.busySince > STUCK_AFTER_MS,
           }));
         return json(res, 200, { bots });
-      }
-      // CEO governance: the designated "ceo" bot may switch another bot's
-      // model (when it stopped responding) and interrupt a hung turn. Only
-      // the ceo role gets this — same shared COMMS_TOKEN gate as ask-bot.
-      if (method === "POST" && path === "/api/internal/set-bot-model") {
-        const body = await readBody(req);
-        const fromBotId = String(body.fromBotId ?? "");
-        const toBotId = String(body.toBotId ?? "");
-        const instanceId = String(body.instanceId ?? "");
-        const model = String(body.model ?? "");
-        const caller = store.bot(fromBotId);
-        if (!caller || caller.role !== "ceo") return json(res, 403, { error: "only the ceo bot may change another bot's model" });
-        const target = store.bot(toBotId);
-        if (!target) return json(res, 404, { error: "no such bot" });
-        const instance = registry.get(instanceId);
-        if (!instance) return json(res, 404, { error: `provider instance "${instanceId}" is unavailable` });
-        const known = instance.models.options.some((o) => o.id === model) || instance.models.default === model;
-        if (!known) return json(res, 400, { error: `model "${model}" not found on instance "${instanceId}"` });
-        store.patchBot(toBotId, { modelSelection: { instanceId, model } });
-        broadcast({ kind: "bot", bot: store.bot(toBotId) });
-        return json(res, 200, { ok: true, modelSelection: { instanceId, model } });
-      }
-      if (method === "POST" && path === "/api/internal/interrupt-bot") {
-        const body = await readBody(req);
-        const fromBotId = String(body.fromBotId ?? "");
-        const toBotId = String(body.toBotId ?? "");
-        const caller = store.bot(fromBotId);
-        if (!caller || caller.role !== "ceo") return json(res, 403, { error: "only the ceo bot may interrupt another bot" });
-        const target = store.bot(toBotId);
-        if (!target) return json(res, 404, { error: "no such bot" });
-        await registry
-          .get(target.modelSelection.instanceId)
-          ?.adapter.interruptTurn(target.threadId)
-          .catch(() => {});
-        store.patchBot(toBotId, { busy: false, busySince: undefined });
-        broadcast({ kind: "bot", bot: store.bot(toBotId) });
-        return json(res, 200, { ok: true });
       }
       if (method === "POST" && path === "/api/internal/ask-bot") {
         const body = await readBody(req);
@@ -983,10 +958,11 @@ const server = createServer(async (req, res) => {
     m = path.match(/^\/api\/groups\/([\w-]+)$/);
     if (m && method === "PATCH") {
       const body = await readBody(req);
-      const patch: Record<string, unknown> = {};
-      for (const key of ["name", "bulletin", "unread"] as const) {
-        if (body[key] !== undefined) patch[key] = body[key];
-      }
+      const patch: Record<string, unknown> = definedOnly({
+        name: stringField(body.name, FIELD_LIMITS.name),
+        bulletin: stringField(body.bulletin, FIELD_LIMITS.bulletin),
+        unread: booleanField(body.unread),
+      });
       if (Array.isArray(body.memberIds)) {
         const ids = body.memberIds.filter((id: unknown): id is string => typeof id === "string" && Boolean(store.bot(id)));
         if (ids.length) patch.memberIds = ids;
@@ -1052,10 +1028,19 @@ const server = createServer(async (req, res) => {
     m = path.match(/^\/api\/bots\/([\w-]+)$/);
     if (m && method === "PATCH") {
       const body = await readBody(req);
-      const patch: Record<string, unknown> = {};
-      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotExpression", "pinned", "hidden", "role"] as const) {
-        if (body[key] !== undefined) patch[key] = body[key];
-      }
+      const patch: Record<string, unknown> = definedOnly({
+        name: stringField(body.name, FIELD_LIMITS.name),
+        title: stringField(body.title, FIELD_LIMITS.title),
+        description: stringField(body.description, FIELD_LIMITS.description),
+        color: stringField(body.color, FIELD_LIMITS.color),
+        mascotExpression: stringField(body.mascotExpression, FIELD_LIMITS.mascotExpression),
+        computer: enumField(body.computer, ["cloud", "local", "off"] as const),
+        modelSelection: modelSelectionField(body.modelSelection),
+        notifications: booleanField(body.notifications),
+        unread: booleanField(body.unread),
+        pinned: booleanField(body.pinned),
+        hidden: booleanField(body.hidden),
+      });
       const bot = store.patchBot(m[1], patch);
       if (!bot) return json(res, 404, { error: "no such bot" });
       broadcast({ kind: "bot", bot });
@@ -1194,7 +1179,7 @@ const server = createServer(async (req, res) => {
     if ((method === "PUT" || method === "PATCH") && path === "/api/config") {
       const body = await readBody(req);
       const patch: Record<string, object> = {};
-      for (const key of ["xai", "nvidia", "deepseek", "composio", "box", "profile"] as const) {
+      for (const key of ["xai", "nvidia", "composio", "box", "profile"] as const) {
         if (body[key] && typeof body[key] === "object") patch[key] = body[key];
       }
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
@@ -1248,239 +1233,23 @@ const server = createServer(async (req, res) => {
       }
     }
 
-    // ── the scheduler: recurring "wake this bot with a prompt" jobs ──
-    m = path.match(/^\/api\/schedules$/);
-    if (m) {
-      if (method === "GET") return json(res, 200, scheduler.list());
-      if (method === "POST") {
-        const body = await readBody(req);
-        const botId = String(body.botId ?? "");
-        if (!store.bot(botId)) return json(res, 404, { error: "no such bot" });
-        const s = scheduler.upsert({
-          id: body.id ? String(body.id) : undefined,
-          botId,
-          cron: String(body.cron ?? ""),
-          prompt: String(body.prompt ?? ""),
-          enabled: body.enabled !== false,
-        });
-        if (!s) return json(res, 400, { error: `invalid cron expression: ${String(body.cron ?? "")}` });
-        return json(res, 200, s);
-      }
-      return json(res, 405, { error: "method not allowed" });
-    }
-    m = path.match(/^\/api\/schedules\/([\w-]+)$/);
-    if (m) {
-      const id = m[1];
-      if (method === "DELETE") {
-        return json(res, 200, { removed: scheduler.remove(id) });
-      }
-      if (method === "PATCH") {
-        const body = await readBody(req);
-        const existing = scheduler.get(id);
-        if (!existing) return json(res, 404, { error: "no such schedule" });
-        const s = scheduler.upsert({
-          id,
-          botId: existing.botId,
-          cron: body.cron !== undefined ? String(body.cron) : existing.cron,
-          prompt: body.prompt !== undefined ? String(body.prompt) : existing.prompt,
-          enabled: body.enabled !== undefined ? !!body.enabled : existing.enabled,
-        });
-        if (!s) return json(res, 400, { error: `invalid cron expression: ${String(body.cron ?? existing.cron)}` });
-        return json(res, 200, s);
-      }
-      return json(res, 405, { error: "method not allowed" });
-    }
-
-    // ── memory RAG: semantic search & knowledge base ────────────────────────
-    if (method === "POST" && path === "/api/memory/rag/search") {
-      const body = await readBody(req);
-      const threadId = String(body.threadId ?? "");
-      const query = String(body.query ?? "").trim();
-      const topK = Number(body.topK ?? 5);
-      if (!threadId || !query) return json(res, 400, { error: "threadId and query required" });
-      const results = await memoryRAG.hybridSearch(threadId, query, { topK });
-      return json(res, 200, { results });
-    }
-    if (method === "POST" && path === "/api/memory/rag/ingest") {
-      const body = await readBody(req);
-      const threadId = String(body.threadId ?? "");
-      const content = String(body.content ?? "").trim();
-      const metadata = (body.metadata as Record<string, unknown>) ?? {};
-      if (!threadId || !content) return json(res, 400, { error: "threadId and content required" });
-      const ids = await memoryRAG.addDocuments(threadId, [{ content, metadata }]);
-      return json(res, 200, { ids });
-    }
-    if (method === "POST" && path === "/api/memory/rag/ingest-file") {
-      const body = await readBody(req);
-      const threadId = String(body.threadId ?? "");
-      const filePath = String(body.path ?? "").trim();
-      const metadata = (body.metadata as Record<string, unknown>) ?? {};
-      if (!threadId || !filePath) return json(res, 400, { error: "threadId and path required" });
-      try {
-        const fs = await import("node:fs/promises");
-        const content = await fs.readFile(filePath, "utf8");
-        const ids = await memoryRAG.ingestFile(threadId, filePath, content, metadata);
-        return json(res, 200, { ids });
-      } catch (e) {
-        return json(res, 500, { error: `Failed to ingest file: ${e instanceof Error ? e.message : String(e)}` });
-      }
-    }
-    if (method === "GET" && path === "/api/memory/rag/stats") {
-      const threadId = url.searchParams.get("threadId");
-      if (!threadId) return json(res, 400, { error: "threadId required" });
-      const stats = memoryRAG.getStats(threadId);
-      return json(res, 200, stats);
-    }
-    if (method === "DELETE" && path === "/api/memory/rag/clear") {
-      const body = await readBody(req);
-      const threadId = String(body.threadId ?? "");
-      if (!threadId) return json(res, 400, { error: "threadId required" });
-      await memoryRAG.clearThread(threadId);
-      return json(res, 200, { ok: true });
-    }
-
-    // ── conversation engine: templates, routing, health ─────────────────────
-    if (method === "GET" && path === "/api/conversation/templates") {
-      return json(res, 200, { templates: conversationEngine.listTemplates() });
-    }
-    if (method === "GET" && path === "/api/conversation/health") {
-      return json(res, 200, conversationEngine.getHealth());
-    }
-    if (method === "POST" && path === "/api/conversation/route") {
-      const body = await readBody(req);
-      const text = String(body.text ?? "");
-      const defaultSelection = body.defaultSelection as { instanceId: string; model: string } | undefined;
-      if (!text || !defaultSelection) return json(res, 400, { error: "text and defaultSelection required" });
-      const routed = conversationEngine.routeModel(text, defaultSelection);
-      return json(res, 200, { modelSelection: routed });
-    }
-
-    // ── tools registry: tools, skills, workflows, MCP ───────────────────────
-    if (method === "GET" && path === "/api/tools") {
-      return json(res, 200, { tools: toolsRegistry.listTools().map((t) => ({ name: t.name, label: t.label, description: t.description, tags: t.tags })) });
-    }
-    if (method === "POST" && path === "/api/tools/execute") {
-      const body = await readBody(req);
-      const name = String(body.name ?? "");
-      const params = (body.params as Record<string, unknown>) ?? {};
-      const role = body.role as string | undefined;
-      if (!name) return json(res, 400, { error: "tool name required" });
-      const result = await toolsRegistry.executeTool(name, params, { role });
-      return json(res, 200, result);
-    }
-    if (method === "GET" && path === "/api/tools/skills") {
-      return json(res, 200, { skills: toolsRegistry.listSkills() });
-    }
-    if (method === "POST" && path === "/api/tools/skills/suggest") {
-      const body = await readBody(req);
-      const query = String(body.query ?? "");
-      const skills = toolsRegistry.suggestSkills(query);
-      return json(res, 200, { skills });
-    }
-    if (method === "GET" && path === "/api/tools/workflows") {
-      return json(res, 200, { workflows: toolsRegistry.listWorkflows() });
-    }
-    if (method === "POST" && path === "/api/tools/workflows/execute") {
-      const body = await readBody(req);
-      const workflowId = String(body.workflowId ?? "");
-      const params = (body.params as Record<string, unknown>) ?? {};
-      if (!workflowId) return json(res, 400, { error: "workflowId required" });
-      try {
-        const result = await toolsRegistry.executeWorkflow(workflowId, params);
-        return json(res, 200, { result });
-      } catch (e) {
-        return json(res, 500, { error: `Workflow execution failed: ${e instanceof Error ? e.message : String(e)}` });
-      }
-    }
-    if (method === "GET" && path === "/api/tools/mcp") {
-      return json(res, 200, { servers: toolsRegistry.listMCPServers().map((s) => ({ name: s.config.name, connected: s.connected, tools: s.tools.length, resources: s.resources.length })) });
-    }
-    if (method === "POST" && path === "/api/tools/mcp/add") {
-      const body = await readBody(req);
-      const config = body.config as { name: string; command: string; args: string[]; env?: Record<string, string>; transport?: "stdio" | "sse" | "websocket"; url?: string };
-      if (!config?.name || !config?.command || !config?.args) return json(res, 400, { error: "name, command, args required" });
-      try {
-        await toolsRegistry.addMCPServer(config);
-        return json(res, 200, { ok: true });
-      } catch (e) {
-        return json(res, 500, { error: `Failed to add MCP server: ${e instanceof Error ? e.message : String(e)}` });
-      }
-    }
-    if (method === "POST" && path === "/api/tools/mcp/remove") {
-      const body = await readBody(req);
-      const name = String(body.name ?? "");
-      if (!name) return json(res, 400, { error: "name required" });
-      const ok = await toolsRegistry.removeMCPServer(name);
-      return json(res, 200, { ok });
-    }
-    if (method === "GET" && path === "/api/tools/mcp/presets") {
-      return json(res, 200, { presets: toolsRegistry.listMCPPresets() });
-    }
-    if (method === "POST" && path === "/api/tools/mcp/preset") {
-      const body = await readBody(req);
-      const name = String(body.name ?? "");
-      if (!name) return json(res, 400, { error: "name required" });
-      try {
-        const server = await toolsRegistry.ensurePresetMCP(name);
-        if (!server) return json(res, 404, { error: `Preset unavailable: ${name} (is the runtime installed?)` });
-        return json(res, 200, { ok: true, name: server.config.name, tools: server.tools.length });
-      } catch (e) {
-        return json(res, 500, { error: `Failed to add MCP preset: ${e instanceof Error ? e.message : String(e)}` });
-      }
-    }
-
-    // ── user profiles ───────────────────────────────────────────────────────
-    if (method === "GET" && path === "/api/profile") {
-      const userId = url.searchParams.get("userId") ?? "default";
-      const profile = memoryRAG.getProfile(userId);
-      return json(res, 200, { profile });
-    }
-    if (method === "PUT" && path === "/api/profile") {
-      const body = await readBody(req);
-      const userId = String(body.userId ?? "default");
-      const profile = memoryRAG.upsertProfile({ id: userId, ...body });
-      return json(res, 200, { profile });
-    }
-
-    // ── knowledge graph ─────────────────────────────────────────────────────
-    if (method === "GET" && path === "/api/knowledge-graph") {
-      const threadId = url.searchParams.get("threadId");
-      if (!threadId) return json(res, 400, { error: "threadId required" });
-      const nodes = memoryRAG.getGraphNodes(threadId);
-      const edges = memoryRAG.getGraphEdges(threadId);
-      return json(res, 200, { nodes, edges });
-    }
-    if (method === "POST" && path === "/api/knowledge-graph/node") {
-      const body = await readBody(req);
-      const threadId = String(body.threadId ?? "");
-      const node = body.node;
-      if (!threadId || !node) return json(res, 400, { error: "threadId and node required" });
-      const created = memoryRAG.addGraphNode(threadId, node);
-      return json(res, 200, { node: created });
-    }
-    if (method === "POST" && path === "/api/knowledge-graph/edge") {
-      const body = await readBody(req);
-      const threadId = String(body.threadId ?? "");
-      const edge = body.edge;
-      if (!threadId || !edge) return json(res, 400, { error: "threadId and edge required" });
-      const created = memoryRAG.addGraphEdge(threadId, edge);
-      return json(res, 200, { edge: created });
-    }
-    if (method === "POST" && path === "/api/knowledge-graph/extract") {
-      const body = await readBody(req);
-      const threadId = String(body.threadId ?? "");
-      const text = String(body.text ?? "");
-      if (!threadId || !text) return json(res, 400, { error: "threadId and text required" });
-      await memoryRAG.buildKnowledgeGraphFromText(threadId, text);
-      return json(res, 200, { ok: true });
-    }
-
     // packaged app: the server serves the built UI too (window → :8799 for
     // everything, no dev proxy to die). OMB_STATIC_DIR is set by Electron.
     if (method === "GET" && !path.startsWith("/api/") && STATIC_DIR) {
-      const safe = path === "/" ? "/index.html" : path.replace(/\.\./g, "");
-      const file = join(STATIC_DIR, safe);
+      // Resolve first, then require the result to stay under the root: the
+      // old ".."-stripping rewrite is a blocklist, and percent-encoded or
+      // overlapping traversals walk straight past it into the filesystem.
+      const root = resolve(STATIC_DIR);
+      let requested = path;
       try {
+        requested = decodeURIComponent(path);
+      } catch {
+        /* malformed escapes — fall back to the raw path */
+      }
+      const file = resolve(root, "." + (requested === "/" ? "/index.html" : requested));
+      const insideRoot = file === root || file.startsWith(root + sep);
+      try {
+        if (!insideRoot) throw new Error("outside the static root");
         const data = readFileSync(file);
         res.writeHead(200, { "content-type": MIME[extname(file)] ?? "application/octet-stream" });
         return res.end(data);
