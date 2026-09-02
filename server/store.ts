@@ -103,6 +103,14 @@ export interface BotRecord {
   pinned?: boolean;
   hidden?: boolean;
   busy?: boolean;
+  /** swarm role: "ceo" designates the manager agent that monitors the rest
+   * and may change their models when they stop responding */
+  role?: "ceo";
+  /** ms epoch when the current turn started (unset when not busy) — lets the
+   * CEO detect a bot that's been busy for an unhealthy long time */
+  busySince?: number;
+  /** ms epoch of the last completed turn */
+  lastActivityAt?: number;
   createdAt: number;
 }
 

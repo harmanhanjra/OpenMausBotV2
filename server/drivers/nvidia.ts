@@ -26,11 +26,13 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { buildPeerTools } from "./primeAgent.ts";
 import { appendNative } from "./native.ts";
+import { DEFAULT_KEY_ENV, DEFAULT_URL, discoverModels } from "./nvidia-shared.ts";
+
+export { DEFAULT_KEY_ENV, DEFAULT_URL, discoverModels, isNonChatModel } from "./nvidia-shared.ts";
 
 const DRIVER_KIND = "nvidia";
-export const DEFAULT_URL = "https://integrate.api.nvidia.com/v1";
-export const DEFAULT_KEY_ENV = "NVIDIA_API_KEY";
 
 // Hosted NIM model catalog — used as the FALLBACK when the live /v1/models
 // discovery (see discoverModels) can't reach the endpoint. The authoritative
@@ -67,64 +69,6 @@ const MODELS: ModelCatalog = {
 // the NIM API. 10-minute TTL; a stale catalog is better than a blocking poll.
 const MODEL_CACHE_TTL_MS = 10 * 60 * 1000;
 const MODEL_CACHE = new Map<string, { at: number; catalog: ModelCatalog }>();
-
-// Non-chat / non-text endpoints the model picker must never offer — /v1/models
-// lists embeddings, rerankers, TTS/ASR, image/video gen, guard/classifier
-// models, and biology tools that 400/422 on /v1/chat/completions. Tokens are
-// matched as raw substrings (case-insensitive) because NIM model IDs
-// concatenate tokens — nv-embedqa-e5-v5, nemoguard, nvclip, bge-m3,
-// nemoretriever — where word boundaries miss the match.
-export function isNonChatModel(id: string): boolean {
-  const t = id.toLowerCase();
-  return [
-    "embed", "rerank", "retriev", "search",
-    "tts", "asr", "whisper", "parakeet", "speech", "vad", "audio", "vocoder",
-    "cosmos", "diffus", "sdxl", "flux", "image-gen", "consistency",
-    "guard", "shield", "reward", "classif", "moderat", "safety", "judge",
-    "alphafold", "esm", "protein", "clip", "bge", "ocr", "img",
-  ].some((token) => t.includes(token));
-}
-
-function prettyLabel(id: string): string {
-  const base = id.split("/").pop() ?? id;
-  const words = base
-    .replace(/[-_]+/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-  return words.length > 48 ? `${words.slice(0, 48)}…` : words;
-}
-
-/** Query the endpoint's OpenAI-compatible /v1/models; null when unreachable
- * or when no chat-capable models are listed. Filtered to text/chat models. */
-export async function discoverModels(baseUrl: string, apiKey: string, timeoutMs = 4000): Promise<ModelCatalog | null> {
-  try {
-    const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/models`, {
-      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) return null;
-    const json: any = await res.json();
-    if (!Array.isArray(json?.data)) return null;
-    const seen = new Set<string>();
-    const rows: Array<{ id?: unknown }> = json.data;
-    const options = rows
-      .map((m) => m.id)
-      .filter((id): id is string => typeof id === "string" && !!id && !isNonChatModel(id) && !seen.has(id))
-      .map((id) => {
-        seen.add(id);
-        return { id, label: prettyLabel(id) };
-      })
-      .sort((a, b) => a.id.localeCompare(b.id));
-    if (!options.length) return null;
-    const def =
-      options.find((o) => o.id === "meta/llama-3.3-70b-instruct") ??
-      options.find((o) => /llama.*3\.3/i.test(o.id) || /nemotron/i.test(o.id)) ??
-      options.find((o) => /instruct|chat/i.test(o.id)) ??
-      options[0];
-    return { default: def.id, options };
-  } catch {
-    return null;
-  }
-}
 
 /** cached, in-place refresh of a mutable catalog (see applyCatalog). */
 async function refreshCatalog(baseUrl: string, apiKey: string, target: ModelCatalog): Promise<boolean> {
@@ -244,22 +188,41 @@ export const NvidiaDriver: ProviderDriver<NvidiaConfig> = {
       createdAt: new Date().toISOString(),
     });
 
+    interface ToolCall {
+      id: string;
+      name: string;
+      arguments: string;
+    }
+    interface CompletionResult {
+      text: string;
+      usage: { input: number; output: number } | null;
+      toolCalls: ToolCall[];
+    }
+
     const complete = async (
-      messages: Array<{ role: string; content: string }>,
+      messages: Array<{ role: string; content?: string; tool_call_id?: string; tool_calls?: unknown[] }>,
       model: string,
-      opts: { stream: boolean; signal?: AbortSignal; onDelta?: (d: string) => void; onReasoning?: (d: string) => void },
-    ): Promise<{ text: string; usage: { input: number; output: number } | null }> => {
+      opts: {
+        stream: boolean;
+        signal?: AbortSignal;
+        onDelta?: (d: string) => void;
+        onReasoning?: (d: string) => void;
+        tools?: unknown[];
+      },
+    ): Promise<CompletionResult> => {
+      const body: Record<string, unknown> = { model, messages, stream: opts.stream };
+      if (opts.tools?.length) body.tools = opts.tools;
       const headers: Record<string, string> = { "content-type": "application/json" };
       if (apiKey) headers.authorization = `Bearer ${apiKey}`;
       const res = await fetch(`${config.url}/chat/completions`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ model, messages, stream: opts.stream }),
+        body: JSON.stringify(body),
         signal: opts.signal ?? AbortSignal.timeout(120_000),
       });
       if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        const parsed: any = JSON.parse(body) || {};
+        const respBody = await res.text().catch(() => "");
+        const parsed: any = JSON.parse(respBody) || {};
         const detail = parsed.error?.message || parsed.error?.errors?.[0]?.message || "";
         const spaceMsg = res.status === 404 ? "Model may not be available on NIM; check https://build.nvidia.com for valid model IDs." : "";
         throw new Error(
@@ -268,18 +231,28 @@ export const NvidiaDriver: ProviderDriver<NvidiaConfig> = {
       }
       if (!opts.stream) {
         const json: any = await res.json();
+        const msg = json.choices?.[0]?.message;
         return {
-          text: json.choices?.[0]?.message?.content ?? "",
+          text: msg?.content ?? "",
           usage: json.usage
             ? {
                 input: json.usage.prompt_tokens ?? json.usage.input_tokens ?? 0,
                 output: json.usage.completion_tokens ?? json.usage.output_tokens ?? 0,
               }
             : null,
+          toolCalls: Array.isArray(msg?.tool_calls)
+            ? msg.tool_calls.map((tc: any) => ({
+                id: tc.id ?? `tc-${Date.now()}`,
+                name: tc.function?.name ?? "",
+                arguments: tc.function?.arguments ?? "{}",
+              }))
+            : [],
         };
       }
       let text = "";
       let usage: { input: number; output: number } | null = null;
+      // streaming tool-call accumulator: NIM sends tool calls as indexed deltas
+      const toolCallBuf = new Map<number, { id: string; name: string; args: string }>();
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buf = "";
@@ -302,12 +275,21 @@ export const NvidiaDriver: ProviderDriver<NvidiaConfig> = {
           }
           const delta = chunk.choices?.[0]?.delta;
           if (delta) {
-            // NIM exposes reasoning text (DeepSeek R1) on its own field
             const reasoning = delta.reasoning_content ?? delta.reasoning;
             if (typeof reasoning === "string" && reasoning) opts.onReasoning?.(reasoning);
             if (typeof delta.content === "string" && delta.content) {
               text += delta.content;
               opts.onDelta?.(delta.content);
+            }
+            if (Array.isArray(delta.tool_calls)) {
+              for (const tc of delta.tool_calls) {
+                const idx = tc.index ?? 0;
+                const entry = toolCallBuf.get(idx) ?? { id: "", name: "", args: "" };
+                if (tc.id) entry.id = tc.id;
+                if (tc.function?.name) entry.name += tc.function.name;
+                if (tc.function?.arguments) entry.args += tc.function.arguments;
+                toolCallBuf.set(idx, entry);
+              }
             }
           }
           if (chunk.usage) {
@@ -318,7 +300,10 @@ export const NvidiaDriver: ProviderDriver<NvidiaConfig> = {
           }
         }
       }
-      return { text, usage };
+      const toolCalls = [...toolCallBuf.values()]
+        .filter((tc) => tc.name)
+        .map((tc) => ({ id: tc.id || `tc-${Date.now()}`, name: tc.name, arguments: tc.args || "{}" }));
+      return { text, usage, toolCalls };
     };
 
     const sendTurn = async (turn: SendTurnInput) => {
@@ -331,7 +316,22 @@ export const NvidiaDriver: ProviderDriver<NvidiaConfig> = {
       const abort = new AbortController();
       active.set(threadId, { abort, turnId });
 
-      const messages = [
+      // Build peer tools from the agents integration (list_bots / ask_bot / CEO tools)
+      const agentsEnv = turn.integrations?.agents?.env;
+      const peerTools = agentsEnv ? buildPeerTools(agentsEnv) : [];
+      const apiTools = peerTools.length
+        ? peerTools.map((t) => ({
+            type: "function",
+            function: {
+              name: t.name,
+              description: t.description,
+              parameters: t.parameters,
+            },
+          }))
+        : undefined;
+      const toolMap = new Map(peerTools.map((t) => [t.name, t]));
+
+      const messages: Array<{ role: string; content?: string; tool_call_id?: string; tool_calls?: unknown[] }> = [
         ...(turn.system ? [{ role: "system", content: turn.system }] : []),
         ...(turn.transcript ?? []).map((m) => ({
           role: m.role === "assistant" ? "assistant" : "user",
@@ -351,20 +351,100 @@ export const NvidiaDriver: ProviderDriver<NvidiaConfig> = {
 
       (async () => {
         try {
-          const { text, usage } = await complete(messages, turn.model || catalog.default, {
-            stream: true,
-            signal: abort.signal,
-            onReasoning: (delta) =>
-              emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "reasoning_text", delta }),
-            onDelta: (delta) =>
-              emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta }),
-          });
-          appendNative(threadId, { dir: "in", source: "nvidia.chat.completions", msg: { text, usage } });
-          if (text.trim()) {
-            emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text });
+          const MAX_TOOL_ROUNDS = 8;
+          let totalUsage: { input: number; output: number } | null = null;
+          let finalText = "";
+
+          // Tool loop: keep calling the API until the model produces text without tool_calls
+          for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+            if (abort.signal.aborted) break;
+            const isLastRound = round === MAX_TOOL_ROUNDS || !apiTools;
+            const modelId = turn.model || catalog.default;
+
+            if (isLastRound || !apiTools) {
+              // Final round: stream the text response
+              const { text, usage } = await complete(messages, modelId, {
+                stream: true,
+                signal: abort.signal,
+                // If the model exhausted the tool budget, force a text-only
+                // response rather than silently dropping another tool call.
+                tools: round === MAX_TOOL_ROUNDS ? undefined : apiTools,
+                onReasoning: (delta) =>
+                  emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "reasoning_text", delta }),
+                onDelta: (delta) =>
+                  emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta }),
+              });
+              finalText = text;
+              if (usage) totalUsage = totalUsage ? { input: totalUsage.input + usage.input, output: totalUsage.output + usage.output } : usage;
+              break;
+            }
+
+            // Intermediate rounds: non-streaming to collect tool calls
+            const { text, usage, toolCalls } = await complete(messages, modelId, {
+              stream: false,
+              signal: abort.signal,
+              tools: apiTools,
+            });
+            if (usage) totalUsage = totalUsage ? { input: totalUsage.input + usage.input, output: totalUsage.output + usage.output } : usage;
+
+            if (toolCalls.length === 0) {
+              // Model produced text without tool calls — stream the final answer
+              if (text) {
+                messages.push({ role: "assistant", content: text });
+                // Re-stream the text through delta events
+                emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: text });
+              }
+              finalText = text;
+              break;
+            }
+
+            // Model wants to call tools — append assistant message with tool_calls
+            messages.push({ role: "assistant", content: text || undefined, tool_calls: toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.arguments } })) });
+
+            // Execute each tool call and append tool results
+            for (const tc of toolCalls) {
+              if (abort.signal.aborted) break;
+              emit({ ...base(threadId, turnId), type: "item.started", itemType: "tool", itemId: tc.id, title: tc.name });
+
+              let result = "";
+              const tool = toolMap.get(tc.name);
+              if (!tool) {
+                result = `Unknown tool: ${tc.name}`;
+              } else {
+                try {
+                  let args: Record<string, unknown> = {};
+                  try { args = JSON.parse(tc.arguments); } catch { /* use empty */ }
+                  // Peer tools are host-owned functions. They currently do not
+                  // need the SDK extension context, but pass the cancellation
+                  // signal through so a cancelled turn cannot keep waiting on
+                  // a peer request.
+                  const out = await tool.execute(tc.id, args);
+                  result = (out.content as Array<{ type: string; text?: string }>)
+                    ?.filter((c) => c.type === "text")
+                    .map((c) => c.text ?? "")
+                    .join("\n") ?? "";
+                } catch (e) {
+                  result = `Tool error: ${(e as Error).message}`;
+                }
+              }
+
+              emit({
+                ...base(threadId, turnId),
+                type: "item.completed",
+                itemType: "tool",
+                itemId: tc.id,
+                ok: !result.startsWith("Tool error:") && !result.startsWith("Unknown tool:"),
+              });
+              messages.push({ role: "tool", tool_call_id: tc.id, content: result });
+            }
           }
-          if (usage) {
-            emit({ ...base(threadId, turnId), type: "thread.token-usage.updated", ...usage });
+
+          appendNative(threadId, { dir: "in", source: "nvidia.chat.completions", msg: { text: finalText, usage: totalUsage } });
+          if (finalText.trim()) {
+            emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: finalText });
+          }
+          if (totalUsage) {
+            emit({ ...base(threadId, turnId), type: "thread.token-usage.updated", ...totalUsage });
           }
           active.delete(threadId);
           emit({ ...base(threadId, turnId), type: "turn.completed", ok: true, stopReason: null, cost: null });
@@ -425,7 +505,7 @@ export const NvidiaDriver: ProviderDriver<NvidiaConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "in-session" },
+        capabilities: { sessionModelSwitch: "in-session", agentsMcp: true },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
         respondToRequest: async () => {
@@ -441,7 +521,7 @@ export const NvidiaDriver: ProviderDriver<NvidiaConfig> = {
         },
       },
       generateText: async (prompt: string) => {
-        const { text } = await complete([{ role: "user", content: prompt }], catalog.default, { stream: false });
+        const { text } = await complete([{ role: "user", content: prompt }], catalog.default, { stream: false, tools: undefined });
         return text;
       },
       dispose: async () => {
