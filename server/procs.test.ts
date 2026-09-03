@@ -38,7 +38,9 @@ describe("spawnCli / execCli / killCliTree", () => {
     const child = spawnCli("printf", ["spawned-ok"], { stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     child.stdout.on("data", (c) => (out += c));
-    const [code] = await once(child, "exit");
+    // `exit` may fire before piped stdio is fully drained (observed on macOS).
+    // `close` is emitted only after the process and its stdio handles close.
+    const [code] = await once(child, "close");
     expect(code).toBe(0);
     expect(out).toBe("spawned-ok");
   });
