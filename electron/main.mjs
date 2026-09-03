@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { startCua, stopCua, registerCuaIpc } from "./cua.mjs";
 import { startSpeech, stopSpeech } from "./speech.mjs";
 import { startUpdater, registerUpdaterIpc } from "./updater.mjs";
+import { safeExternalUrl } from "./security.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
@@ -136,8 +137,18 @@ function createWindow() {
   });
 
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    const externalUrl = safeExternalUrl(url);
+    if (externalUrl) void shell.openExternal(externalUrl);
     return { action: "deny" };
+  });
+
+  // Keep the renderer pinned to the app origin. Links intended for the web
+  // are opened by the handler above; unexpected in-window navigations are
+  // blocked even if future UI code forgets target="_blank".
+  win.webContents.on("will-navigate", (event, url) => {
+    const current = new URL(win.webContents.getURL());
+    const destination = new URL(url);
+    if (destination.origin !== current.origin) event.preventDefault();
   });
 
   if (app.isPackaged) {

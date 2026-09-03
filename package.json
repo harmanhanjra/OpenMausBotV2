@@ -14,7 +14,7 @@
     "dev:desktop": "electron .",
     "build": "tsc -b && tsc -p tsconfig.server.json && vite build",
     "typecheck": "tsc -b && tsc -p tsconfig.server.json",
-    "test": "vitest run",
+    "test": "vitest run && node --test electron/**/*.test.mjs",
     "test:watch": "vitest",
     "preview": "vite preview",
     "build:server": "tsc -p tsconfig.server.build.json",
